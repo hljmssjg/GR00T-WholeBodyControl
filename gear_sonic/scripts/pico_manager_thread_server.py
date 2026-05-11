@@ -71,8 +71,13 @@ except ImportError:
     remove_smpl_base_rot = None
     smpl_root_ytoz_up = None
 
+# XR backend selector. Default is the Meta Quest Pro JSON-over-TCP shim;
+# set XR_BACKEND=pico to use the real XRoboToolkit SDK + foot trackers.
 try:
-    import xrobotoolkit_sdk as xrt
+    if os.environ.get("XR_BACKEND", "quest") == "pico":
+        import xrobotoolkit_sdk as xrt
+    else:
+        import quest_xr_shim as xrt
 except ImportError:
     xrt = None
 
@@ -362,7 +367,8 @@ def run_vr3pt_live_visualizer():
     print("=" * 60)
 
     # Initialize XRT
-    subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
+    if os.environ.get("XR_BACKEND", "quest") == "pico":
+        subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
     xrt.init()
     print("Waiting for body tracking data...")
     while not xrt.is_body_data_available():
@@ -412,7 +418,8 @@ def run_vr3pt_realtime_visualizer(update_hz: int = 10):
     print("=" * 60)
 
     # Initialize XRT
-    subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
+    if os.environ.get("XR_BACKEND", "quest") == "pico":
+        subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
     xrt.init()
     print("Waiting for body tracking data...")
     while not xrt.is_body_data_available():
@@ -1510,7 +1517,8 @@ def run_pico(
         raise ImportError(
             "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run Pico streaming."
         )
-    subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
+    if os.environ.get("XR_BACKEND", "quest") == "pico":
+        subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
     xrt.init()
     print("Waiting for body tracking data...")
     while not xrt.is_body_data_available():
@@ -1814,6 +1822,7 @@ def run_pico_manager(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    force_vr_3pt: bool = False,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1825,7 +1834,8 @@ def run_pico_manager(
         raise ImportError(
             "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run the manager."
         )
-    subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
+    if os.environ.get("XR_BACKEND", "quest") == "pico":
+        subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
     xrt.init()
     print("Waiting for body tracking data...")
     while not xrt.is_body_data_available():
@@ -1925,7 +1935,11 @@ def run_pico_manager(
             new_mode = current_mode
             if current_mode == StreamMode.OFF:
                 if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.PLANNER
+                    # With --force-vr-3pt (Quest backend), POSE/FROZEN are
+                    # unreachable, so skip PLANNER and land directly in VR_3PT.
+                    new_mode = (
+                        StreamMode.PLANNER_VR_3PT if force_vr_3pt else StreamMode.PLANNER
+                    )
                     # Calibrate VR 3pt tracking NOW: operator should be in zero-ref pose.
                     # Uses the current Pico SMPL frame + FK of all-zero body joints.
                     sample = reader.get_latest()
@@ -1973,14 +1987,17 @@ def run_pico_manager(
                 #   left_axis_click → return to parent (PLANNER or FROZEN)
                 #   ax_pressed      → POSE (chain 2 exit)
                 #   by_pressed      → POSE (chain 1 exit)
+                # With --force-vr-3pt only the emergency stop is honored,
+                # because POSE/FROZEN need full-SMPL data Quest cannot provide.
                 if start_combo and not prev_start_combo:
                     new_mode = StreamMode.OFF
-                elif left_axis_click and not prev_left_axis_click:
-                    new_mode = vr3pt_parent_mode  # Return to parent mode
-                elif ax_pressed and not prev_ax_pressed:
-                    new_mode = StreamMode.POSE
-                elif by_pressed and not prev_by_pressed:
-                    new_mode = StreamMode.POSE
+                elif not force_vr_3pt:
+                    if left_axis_click and not prev_left_axis_click:
+                        new_mode = vr3pt_parent_mode  # Return to parent mode
+                    elif ax_pressed and not prev_ax_pressed:
+                        new_mode = StreamMode.POSE
+                    elif by_pressed and not prev_by_pressed:
+                        new_mode = StreamMode.POSE
 
             # Handle mode transitions before running loop
             if new_mode != current_mode:
@@ -2156,6 +2173,17 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable SMPL body joint visualization (24 joint spheres) in the VR3pt viewer",
     )
+    parser.add_argument(
+        "--force-vr-3pt",
+        dest="force_vr_3pt",
+        action="store_true",
+        help=(
+            "Lock the manager state machine into PLANNER_VR_3PT. Required for the "
+            "Quest Pro backend, which cannot produce the full 24-joint SMPL needed "
+            "for POSE / PLANNER_FROZEN_UPPER_BODY modes. Emergency stop "
+            "(A+B+X+Y) still returns to OFF."
+        ),
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2196,6 +2224,7 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
+            force_vr_3pt=args.force_vr_3pt,
         )
     else:
         # Run legacy single-thread pose streaming

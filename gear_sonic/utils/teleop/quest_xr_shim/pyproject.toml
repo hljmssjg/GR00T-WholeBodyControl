@@ -1,0 +1,17 @@
+[project]
+name = "quest_xr_shim"
+version = "0.1.0"
+description = "Drop-in xrobotoolkit_sdk-compatible shim that receives Meta Quest Pro tracking over TCP/JSON."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+]
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["quest_xr_shim*"]

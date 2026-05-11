@@ -21,7 +21,7 @@ Starts the full data collection stack in a single tmux session:
 Prerequisites:
     - tmux installed (sudo apt install tmux)
     - Virtual environments set up:
-        bash install_scripts/install_pico.sh          -> .venv_teleop
+        bash install_scripts/install_meta.sh          -> .venv_teleop
         bash install_scripts/install_data_collection.sh -> .venv_data_collection
     - gear_sonic_deploy built (see docs)
     - For sim: .venv_sim must exist (see install instructions)
@@ -166,7 +166,7 @@ def _check_prerequisites(sim: bool = False):
 
     if not (repo_root / ".venv_teleop" / "bin" / "activate").exists():
         errors.append(
-            ".venv_teleop not found. Run: bash install_scripts/install_pico.sh"
+            ".venv_teleop not found. Run: bash install_scripts/install_meta.sh"
         )
 
     if not (repo_root / ".venv_data_collection" / "bin" / "activate").exists():

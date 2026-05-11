@@ -30,7 +30,7 @@ Run **three terminals** to teleoperate the simulated robot.
 From the **repo root**:
 
 ```bash
-# bash install_scripts/install_pico.sh
+# bash install_scripts/install_meta.sh
 
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/run_sim_loop.py

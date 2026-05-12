@@ -69,16 +69,61 @@ python gear_sonic/scripts/pico_manager_thread_server.py --manager --vis_vr3pt --
 - 触发 `calibrate_now`,此刻姿态记为零位
 - 状态机进 `PLANNER_VR_3PT`,PyVista 里 G1 出现并跟手腕
 
-**眼睛检查 4 件事**:
+**眼睛检查**(分两类——PyVista 里和 PyVista 外):
+
+**PyVista 里能看到的(上半身追踪)**:
 
 1. 抬左手 → G1 左手抬(不是右手)
 2. 抬右手 → G1 右手抬
-3. 向前走 → G1 向前(不是后/左/右)
-4. 转身 → G1 跟着转
 
-**任何一项错位**: Unity↔机器人坐标变换的 `Q` 矩阵需要调,见 [`_compute_rel_transform`](../gear_sonic/scripts/pico_manager_thread_server.py#L169)(`Q = [[-1,0,0],[0,0,1],[0,1,0]]`)。
+**PyVista 里看不到的(base/yaw 是 ZMQ 发给 sim 的,不进 visualizer)**:
+
+3. **左摇杆推前** → G1 base 前移。不起 sim 的最快验证:跑 [debug_planner_sub.py](../gear_sonic/scripts/debug_planner_sub.py) 监听 `tcp://*:5556` 的 `planner` topic,推杆时 `movement` 出现非零 world-frame XY、松手归零。
+4. **右摇杆推右** → `yaw_accumulator` 累积 yaw。同上看 `facing`:顺时针累积旋转(满杆约 -2.9 rad/s),**松手停在新角度不归零**(累积器,非速率)。
+
+**档位切换**(只在 StreamMode 是 PLANNER_* 时生效,即 [PlannerLoop.run_once](../gear_sonic/scripts/pico_manager_thread_server.py#L1715-L1725)):
+
+- **A+B 单独按**(松开 X 和 Y)→ `self.mode += 1`(IDLE → SLOW_WALK → WALK → RUN → ... → INJURED_WALK,cap 19)
+- **X+Y 单独按**(松开 A 和 B)→ `self.mode -= 1`(底到 IDLE=0)
+- **A+B+X+Y 同帧**:加一减一**互抵**,自身不动档,但外层会把 StreamMode 切了(OFF ↔ VR_3PT)
+
+注意:wire 上的 `mode` 字段 ≠ `self.mode`。**左摇杆在死区时,wire `mode` 被强制写成 IDLE=0、`speed=-1`**,无论当前选的是什么档([pico_manager_thread_server.py:1735-1743](../gear_sonic/scripts/pico_manager_thread_server.py#L1735-L1743))。所以"按了 A+B 升档但 sub 看到 mode 还是 0"是正常的,推杆出死区后才会看到真档位。
+
+PyVista 里 G1 的 base 永远固定在原点+面向同一方向——它只渲染相对 root 的 3-point 追踪。
+
+**任何一项错位**: 先看 §4.1 排查顺序,**不要先动 `Q` 矩阵**。
 
 紧急停止: 再按一次 `A+B+X+Y` → OFF。
+
+---
+
+## 4.1 wrist 旋转轴错位的排查与修法(2026-05-12 bring-up 复盘)
+
+> 下游风险评估见 [quest_pro_postmul_下游风险.md](quest_pro_postmul_下游风险.md)。
+
+
+第一次跑 Step 4 时观察到:抬手位置都对,但 wrist 旋转轴串台——physical-Z(上)旋转 → G1 wrist 绕 Y 转;physical-Y → G1 X 转。两只手都一样。
+
+**正确排查顺序(先硬件、后代码)**:
+
+1. **检查 HMD 是不是真戴在头上**。`smpl_fake.py` 里 `joint 12 (neck) = head_pose`,挂脖子上 → HMD 屏幕朝上 → neck quat 含 ~90° pitch → `_calibration_neck_quat_inv` 把这个 pitch 锁死,后续每帧 wrist 都被这个 pitch 左乘,X/Z 轴会互换。**戴头上能修掉大部分轴错位**(尤其是 X/Z 互换)。
+2. **检查 controller 握法 + 标定姿态**。OFFSETS 假设了一个特定的初始 wrist 朝向([pico_manager_thread_server.py:164-171](../gear_sonic/scripts/pico_manager_thread_server.py#L164-L171)),歪握或者半蹲标定都会偏。
+3. 排除完硬件再考虑代码。
+
+**代码侧改动(commit `cdbd8b1`)**: `_apply_calibration` 里 wrist 的 `rot_offset` 从 premul 改成 postmul。
+
+- 旧 (premul): `calibrated = rot_offset * calib_inv * wrist`。世界帧每个旋转 delta 被 `(rot_offset * calib_inv)` 相似变换扭一遍,即使 HMD 戴正,`rot_offset` 这一层(`g1_lwrist_rot * lwrist_corrected_inv`)仍会绕走轴。
+- 新 (postmul): `calibrated = (calib_inv * wrist) * rot_offset`。`rot_offset` 只用来让标定瞬间对齐 G1 初始 wrist 姿态,不再扭曲后续 delta。
+- **门控在 `XR_BACKEND != "pico"`**(`use_intrinsic_wrist_offset=_IS_QUEST_BACKEND`),Pico 路径完全保留旧 premul,避免回归。
+- 改动位置: [pico_manager_thread_server.py:894-925](../gear_sonic/scripts/pico_manager_thread_server.py#L894-L925)(`ThreePointPose.__init__`)、[`_capture_calibration`](../gear_sonic/scripts/pico_manager_thread_server.py#L1084-L1099) 和 [`_apply_calibration`](../gear_sonic/scripts/pico_manager_thread_server.py#L1123-L1152)。
+
+**实测**(HMD 戴正 + postmul gate):L/R wrist 三轴旋转都正确。回退 postmul 仍会出现 wrist 轴跑偏,说明这一层改动是必要的、不是 HMD 单点问题。
+
+**§4.3 / §4.4 验证完成(2026-05-12)**:不起 sim,改走 ZMQ subscriber 路径——写了 [debug_planner_sub.py](../gear_sonic/scripts/debug_planner_sub.py),订阅 `tcp://localhost:5556` 的 `planner` topic,打印 `mode/movement/facing/speed`。实测:
+
+- 左摇杆推前 → `movement` 在 world frame 出现非零 XY、松手归零;反推 local frame 一致 ✓
+- 右摇杆推右 → `facing` 顺时针累积旋转(满杆约 -2.9 rad/s),松手停住不归零 ✓
+- wire `mode` 始终是 0 是预期行为(见上节关于 deadzone 强制 IDLE 的说明,以及 A+B+X+Y 同帧 ±1 互抵的 bring-up 教训)
 
 ---
 
@@ -122,8 +167,11 @@ PY <episode.parquet 路径>
 | `is_body_data_available()` 一直 False | APK 没发 / 防火墙挡 :63901 | `sudo ufw allow 63901/tcp` |
 | G1 手腕在原点抽搐 | head/controller 长期发 sentinel | 检查 APK 追踪状态,佩戴方式 |
 | G1 走的方向反 | Unity 左手系 ↔ 机器人右手系 `Q` 矩阵 | 调 `Q` 的对应行符号 |
+| wrist 旋转轴串台(X/Y/Z 互错) | HMD 没戴对 / `rot_offset` premul 扭曲 delta | 先戴正 HMD;若仍偏,见 §4.1,代码已在 commit `cdbd8b1` 加 postmul 门控 |
 | 录数据时 parquet 没生成 | run_data_exporter 没起 / .venv_data_collection 缺 | 看 tmux 各窗口报错 |
 | 录到的 `action.motion_token` 全零 | encoder ONNX 路径错;输入是无效 SMPL | 看 manager 日志里 token 是否被打印 |
+| 按 A+B+X+Y 进 VR_3PT 后档位没升 | 4 键同帧:A+B 加 1、X+Y 减 1,互抵 | 进 VR_3PT 后**全部松手 1 秒**,再单独按 A+B(松开 X 和 Y) |
+| sub 看到 wire `mode` 一直 0 | (a) 左摇杆在死区 → 强制 IDLE;(b) `self.mode` 没升档 | 检查摇杆是否推出死区,manager terminal 是否打过 `[PlannerLoop] Mode -> N` |
 
 ---
 
@@ -137,3 +185,4 @@ PY <episode.parquet 路径>
 | 安装 Quest 后端 | [install_scripts/install_meta.sh](../install_scripts/install_meta.sh) |
 | 安装 LeRobot 导出 | [install_scripts/install_data_collection.sh](../install_scripts/install_data_collection.sh) |
 | 设计 + JSON 协议 | [quest_pro_shim_设计.md](quest_pro_shim_设计.md) |
+| 不起 sim 验证 base/yaw | [gear_sonic/scripts/debug_planner_sub.py](../gear_sonic/scripts/debug_planner_sub.py) |

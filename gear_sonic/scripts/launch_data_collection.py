@@ -125,6 +125,11 @@ class DataCollectionLaunchConfig:
     pico_waist_tracking: bool = False
     """Enable waist tracking on the teleop streamer."""
 
+    pico_force_vr_3pt: bool = True
+    """Force state machine into PLANNER_VR_3PT after the 4-button calibration.
+    Required for the Quest backend (no full-SMPL data). Set False only when running
+    XR_BACKEND=pico with the XRoboToolkit SDK."""
+
     # Data exporter options
     task_prompt: str = "demo"
     """Language task prompt for the data exporter."""
@@ -363,6 +368,8 @@ def main(config: DataCollectionLaunchConfig):
         pico_cmd += " --vis_smpl"
     if config.pico_waist_tracking:
         pico_cmd += " --waist_tracking"
+    if config.pico_force_vr_3pt:
+        pico_cmd += " --force-vr-3pt"
 
     print("Starting PICO teleop streamer (pane 2)...")
     _send_to_pane(1, pico_cmd, wait=2.0)

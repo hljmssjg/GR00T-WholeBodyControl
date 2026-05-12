@@ -20,11 +20,18 @@ from gear_sonic.camera.sensor_server import CameraMountPosition
 
 
 class USBCameraConfig:
-    """Configuration for generic USB camera."""
+    """Configuration for generic USB camera.
+
+    For side-by-side stereo modules (single USB, two sensors stitched horizontally)
+    set image_dim to the full stitched resolution (e.g. 2560x720) and stereo_crop to
+    "left" or "right" — the driver crops one eye before publishing.
+    """
 
     image_dim: tuple = (640, 480)
-    fps: int = 30
+    fps: int = 60
     device_index: int = 0
+    fourcc: str = "MJPG"
+    stereo_crop: str | None = None
 
 
 class USBCameraSensor(Sensor):
@@ -38,6 +45,7 @@ class USBCameraSensor(Sensor):
     ):
         self.config = config
         self.mount_position = mount_position
+        self.stereo_crop = config.stereo_crop
 
         idx = device_index if device_index is not None else config.device_index
 
@@ -45,6 +53,9 @@ class USBCameraSensor(Sensor):
         if not self.cap.isOpened():
             raise RuntimeError(f"Failed to open USB camera at index {idx}")
 
+        if config.fourcc:
+            fourcc = cv2.VideoWriter_fourcc(*config.fourcc)
+            self.cap.set(cv2.CAP_PROP_FOURCC, fourcc)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.image_dim[0])
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.image_dim[1])
         self.cap.set(cv2.CAP_PROP_FPS, config.fps)
@@ -62,12 +73,21 @@ class USBCameraSensor(Sensor):
         height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print(f"  Resolution: {width}x{height}")
         print(f"  FPS: {self.cap.get(cv2.CAP_PROP_FPS)}")
+        if self.stereo_crop:
+            print(f"  Stereo crop: {self.stereo_crop} half → {width // 2}x{height}")
 
     def read(self) -> dict[str, Any] | None:
         ret, frame = self.cap.read()
         if not ret or frame is None:
             print(f"[{self.mount_position}] USB camera read failed: ret={ret}")
             return None
+
+        if self.stereo_crop:
+            half = frame.shape[1] // 2
+            if self.stereo_crop == "left":
+                frame = frame[:, :half]
+            elif self.stereo_crop == "right":
+                frame = frame[:, half:]
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         return {

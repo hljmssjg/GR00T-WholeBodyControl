@@ -127,9 +127,42 @@ PyVista 里 G1 的 base 永远固定在原点+面向同一方向——它只渲�
 
 ---
 
+## 4.5 用 sim 走一遍数采全链路(dry-run,不接真机)
+
+§4 只验了 manager 内部的坐标/标定 + planner ZMQ 输出,数采链路下游(C++ deploy → sim → run_data_exporter → parquet)还没动过。先在 sim 里把整条链路跑通,再上真机。
+
+**前置**: `.venv_sim` 已装好(`ls -d .venv_sim/bin/activate`),`gear_sonic_deploy/` 已编译。
+
+```bash
+python gear_sonic/scripts/launch_data_collection.py \
+    --sim \
+    --pico-vis-vr3pt \
+    --task-prompt "sim_dryrun" \
+    --no-text-to-speech
+```
+
+会起一个 `sonic_data_collection` tmux session:窗口 0(4 pane: deploy / data exporter / pico manager / camera viewer)+ 窗口 1(sim)。`tmux attach -t sonic_data_collection`,`Ctrl-b w` 切窗口。
+
+**逐项确认**(出问题在哪个 pane 就在哪个 pane 看 trace,不要直接 kill session):
+
+| 检查 | 期望 | 失败处置 |
+|---|---|---|
+| 窗口 1 sim | MuJoCo viewer 弹出,G1 站在原点 | `.venv_sim` 没装好;mujoco GL 驱动;无 DISPLAY |
+| pane 0 deploy | `./deploy.sh sim` 不报错,等 zmq_manager 输入 | `gear_sonic_deploy` 未编译;deploy_checkpoint/obs_config 路径错 |
+| pane 2 pico manager | §3 那串 listening 日志,Quest 连上 | 同 §3 |
+| 4 键标定 → 进 PLANNER_VR_3PT | sim 里 G1 跟着手腕动、左摇杆推前 base 前移、右摇杆推右 yaw 累积 | 现象和 §4 不一致:回 §4 / §4.1 排查,**不要在 sim 里调** |
+| pane 1 data exporter | 周期性打 frame 计数,无 sentinel 警告 | run_data_exporter 没拿到 camera 流;`--camera-port` 冲突 |
+| 触发录制 → 停止 | exporter pane 打出 parquet 路径 | 看 exporter trace,通常是 dataset_name 目录权限 |
+
+**录 1 条 < 30 秒的 episode**,落盘后 `Ctrl-b &` 关 session,直接进 §6 校验 parquet。**§6 通过 = dry-run 通过**,这条 episode 别留着当训练数据。
+
+dry-run 不通过 → 不要进 §5。sim 跑不通的链路接真机只会更难 debug,而且真机失败的损失更大(操作员姿态、安全员、场地占用)。
+
+---
+
 ## 5. 真跑数据采集
 
-坐标系对上后:
+§4.5 走通后,把 `--sim` 去掉(其它参数照旧):
 
 ```bash
 python gear_sonic/scripts/launch_data_collection.py [task_args]

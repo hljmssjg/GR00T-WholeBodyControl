@@ -73,8 +73,10 @@ except ImportError:
 
 # XR backend selector. Default is the Meta Quest Pro JSON-over-TCP shim;
 # set XR_BACKEND=pico to use the real XRoboToolkit SDK + foot trackers.
+_XR_BACKEND = os.environ.get("XR_BACKEND", "quest")
+_IS_QUEST_BACKEND = _XR_BACKEND != "pico"
 try:
-    if os.environ.get("XR_BACKEND", "quest") == "pico":
+    if _XR_BACKEND == "pico":
         import xrobotoolkit_sdk as xrt
     else:
         import quest_xr_shim as xrt
@@ -845,6 +847,7 @@ def _pose_stream_common(
         enable_waist_tracking=enable_waist_tracking,
         enable_smpl_vis=enable_smpl_vis,
         log_prefix=log_prefix,
+        use_intrinsic_wrist_offset=_IS_QUEST_BACKEND,
     )
 
     streamer = PoseStreamer(
@@ -899,6 +902,7 @@ class ThreePointPose:
         enable_smpl_vis: bool = False,
         log_prefix: str = "ThreePointPose",
         robot_model=None,
+        use_intrinsic_wrist_offset: bool = False,
     ):
         """
         Initialize 3-point pose processor.
@@ -916,6 +920,9 @@ class ThreePointPose:
         self.with_g1_robot = with_g1_robot
         self.enable_waist_tracking = enable_waist_tracking
         self.enable_smpl_vis = enable_smpl_vis
+        # Quest backend needs intrinsic (postmul) wrist offset to preserve
+        # world-frame rotation axes; Pico path keeps the legacy premul behavior.
+        self._use_intrinsic_wrist_offset = use_intrinsic_wrist_offset
 
         # Robot model for FK-based calibration (headless, no display required)
         self._robot_model = robot_model
@@ -1081,9 +1088,17 @@ class ThreePointPose:
         self._calibration_lwrist_offset = lwrist_pos_corrected - g1_lwrist_pos
         self._calibration_rwrist_offset = rwrist_pos_corrected - g1_rwrist_pos
 
-        # Compute orientation offsets: calibrated = rot_offset * neck_corrected
-        self._calibration_lwrist_rot_offset = g1_lwrist_rot * lwrist_rot_corrected.inv()
-        self._calibration_rwrist_rot_offset = g1_rwrist_rot * rwrist_rot_corrected.inv()
+        # Compute orientation offsets.
+        # Legacy (Pico): premul. calibrated = rot_offset * neck_corrected.
+        # Intrinsic (Quest): postmul. calibrated = neck_corrected * rot_offset.
+        # Postmul preserves world-frame rotation axes through the pipeline;
+        # premul similarity-transforms every delta by rot_offset.
+        if self._use_intrinsic_wrist_offset:
+            self._calibration_lwrist_rot_offset = lwrist_rot_corrected.inv() * g1_lwrist_rot
+            self._calibration_rwrist_rot_offset = rwrist_rot_corrected.inv() * g1_rwrist_rot
+        else:
+            self._calibration_lwrist_rot_offset = g1_lwrist_rot * lwrist_rot_corrected.inv()
+            self._calibration_rwrist_rot_offset = g1_rwrist_rot * rwrist_rot_corrected.inv()
 
         self._calibration_pending = False
         self._override_robot_q = None
@@ -1120,17 +1135,22 @@ class ThreePointPose:
                 calib_inv_rot.apply(vr_3pt_pose[1, :3]) - self._calibration_rwrist_offset
             )
 
-        # Wrist orientations: rot_offset * (neck_inv * current)
+        # Wrist orientations. Order matches whichever convention was used at
+        # capture time (see _capture_calibration for the premul/postmul branch).
         if self._calibration_lwrist_rot_offset is not None:
             lw_corrected = calib_inv_rot * sRot.from_quat(vr_3pt_pose[0, 3:], scalar_first=True)
-            calibrated[0, 3:] = (self._calibration_lwrist_rot_offset * lw_corrected).as_quat(
-                scalar_first=True
-            )
+            if self._use_intrinsic_wrist_offset:
+                lw_final = lw_corrected * self._calibration_lwrist_rot_offset
+            else:
+                lw_final = self._calibration_lwrist_rot_offset * lw_corrected
+            calibrated[0, 3:] = lw_final.as_quat(scalar_first=True)
         if self._calibration_rwrist_rot_offset is not None:
             rw_corrected = calib_inv_rot * sRot.from_quat(vr_3pt_pose[1, 3:], scalar_first=True)
-            calibrated[1, 3:] = (self._calibration_rwrist_rot_offset * rw_corrected).as_quat(
-                scalar_first=True
-            )
+            if self._use_intrinsic_wrist_offset:
+                rw_final = rw_corrected * self._calibration_rwrist_rot_offset
+            else:
+                rw_final = self._calibration_rwrist_rot_offset * rw_corrected
+            calibrated[1, 3:] = rw_final.as_quat(scalar_first=True)
 
         # Neck position via kinematic chain: root → torso_link (+Z) → neck (along calibrated Z)
         neck_z = sRot.from_quat(calibrated[2, 3:], scalar_first=True).apply([0, 0, 1])
@@ -1866,6 +1886,7 @@ def run_pico_manager(
         enable_waist_tracking=enable_waist_tracking,
         enable_smpl_vis=enable_smpl_vis,
         log_prefix="PoseLoop",
+        use_intrinsic_wrist_offset=_IS_QUEST_BACKEND,
     )
 
     pose_streamer = PoseStreamer(

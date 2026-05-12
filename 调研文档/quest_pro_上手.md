@@ -14,6 +14,7 @@
 | 主机 ↔ Quest 网络 | 同局域网,主机 IP 能从头盔 ping 通 |
 | Quest Unity APK | 已装,能发设计文档 §3 那种 JSON,目标 `主机IP:63901`,TCP 模式 |
 | 操作员姿态 | 站立,会保持上半身直立(下半身靠 SONIC 规划) |
+| 头显佩戴 | **必须戴在头上,不能挂脖子上**。`smpl_fake.py` 里 neck (joint 12) = HMD 姿态,挂脖子上会让 `calib_inv` 含 pitch,wrist 旋转轴会被相似变换扭歪 |
 
 **没有 Unity APK 一切免谈**——这是阻塞项,先解决。
 

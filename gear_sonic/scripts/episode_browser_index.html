@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Episode Browser</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #181b22;
+    --panel-2: #21252e;
+    --border: #2a2f3a;
+    --text: #e6e8ee;
+    --muted: #8a93a6;
+    --accent: #4f8cff;
+    --accent-2: #79a6ff;
+    --danger: #ef4f5e;
+    --danger-2: #ff7280;
+    --warn: #f5b545;
+    --ok: #3cc28a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif; }
+  header {
+    position: sticky; top: 0; z-index: 5;
+    background: rgba(15,17,21,0.95); backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border); padding: 12px 18px;
+  }
+  .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .title { font-size: 18px; font-weight: 600; }
+  .meta { color: var(--muted); font-size: 13px; }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tab {
+    padding: 6px 12px; border-radius: 14px;
+    background: var(--panel-2); border: 1px solid var(--border);
+    color: var(--text); cursor: pointer; font-size: 13px;
+  }
+  .tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .pager { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+  .pager button {
+    background: var(--panel-2); border: 1px solid var(--border);
+    color: var(--text); padding: 5px 10px; border-radius: 6px;
+    cursor: pointer; font-size: 13px;
+  }
+  .pager button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .pager .info { color: var(--muted); font-size: 13px; min-width: 110px; text-align: center; }
+
+  main { padding: 16px; }
+  .grid {
+    display: grid; gap: 14px;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; overflow: hidden;
+    display: flex; flex-direction: column;
+  }
+  .card.deleting { opacity: 0.45; pointer-events: none; }
+  .card-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 10px; border-bottom: 1px solid var(--border);
+    background: var(--panel-2);
+  }
+  .ep-num { font-weight: 600; font-size: 14px; }
+  .ep-len { color: var(--muted); font-size: 12px; }
+  .badge {
+    font-size: 11px; padding: 2px 8px; border-radius: 10px;
+    background: rgba(245,181,69,0.18); color: var(--warn);
+    border: 1px solid rgba(245,181,69,0.35);
+  }
+  .video-wrap {
+    position: relative; aspect-ratio: 4 / 3; background: #000;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .video-wrap video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  .video-wrap .nodata {
+    color: var(--muted); font-size: 12px; padding: 12px; text-align: center;
+  }
+  .controls {
+    display: flex; gap: 4px; padding: 6px 8px; border-top: 1px solid var(--border);
+  }
+  .controls button {
+    flex: 1; background: var(--panel-2); border: 1px solid var(--border);
+    color: var(--text); padding: 5px 0; border-radius: 6px; cursor: pointer;
+    font-size: 13px;
+  }
+  .controls button:hover { background: #2c3140; }
+  .controls .danger { color: var(--danger-2); border-color: rgba(239,79,94,0.4); }
+  .controls .danger:hover { background: rgba(239,79,94,0.18); }
+  .task {
+    padding: 6px 10px 8px; font-size: 12px; color: var(--muted);
+    border-top: 1px solid var(--border); min-height: 28px;
+  }
+
+  .empty {
+    color: var(--muted); padding: 40px; text-align: center; font-size: 14px;
+  }
+
+  /* Modal */
+  .modal-bg {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+    display: none; align-items: center; justify-content: center; z-index: 10;
+  }
+  .modal-bg.open { display: flex; }
+  .modal {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 18px 20px; width: min(420px, 92vw);
+  }
+  .modal h3 { margin: 0 0 8px 0; font-size: 16px; }
+  .modal p { margin: 0 0 16px 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+  .modal .actions { display: flex; gap: 8px; justify-content: flex-end; }
+  .modal button {
+    padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--panel-2); color: var(--text); cursor: pointer; font-size: 13px;
+  }
+  .modal button.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+
+  .toast {
+    position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+    background: var(--panel-2); border: 1px solid var(--border);
+    color: var(--text); padding: 8px 14px; border-radius: 8px;
+    font-size: 13px; opacity: 0; transition: opacity .2s; z-index: 20;
+  }
+  .toast.show { opacity: 1; }
+  .toast.err { border-color: rgba(239,79,94,0.4); color: var(--danger-2); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="row">
+    <div class="title">Episode Browser</div>
+    <div class="meta" id="dataset-meta">loading…</div>
+    <div class="pager">
+      <button id="prev">◀ 上一页</button>
+      <span class="info" id="page-info">– / –</span>
+      <button id="next">下一页 ▶</button>
+    </div>
+  </div>
+  <div class="row" style="margin-top: 10px;">
+    <span class="meta">Camera：</span>
+    <div class="tabs" id="cam-tabs"></div>
+  </div>
+</header>
+
+<main>
+  <div id="grid" class="grid"></div>
+  <div id="empty" class="empty" style="display:none;">没有可显示的 episode。</div>
+</main>
+
+<div class="modal-bg" id="modal-bg">
+  <div class="modal">
+    <h3 id="modal-title">标记 Episode <span id="modal-idx"></span> 为 discard</h3>
+    <p id="modal-body">
+      把该 episode 的 index 写入 <code>info.json</code> 的
+      <code>discarded_episode_indices</code>（与采集时按 <code>x</code> 等价）。<br>
+      <strong>不动文件</strong>，训练加载器会跳过；之后还可以撤销。
+    </p>
+    <div class="actions">
+      <button id="modal-cancel">取消</button>
+      <button id="modal-confirm" class="danger">确认</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const PAGE_SIZE = 30;
+
+const state = {
+  episodes: [],
+  cameras: [],
+  activeCam: null,
+  page: 0,
+  pending: null,   // { idx, discarded: boolean }
+  datasetPath: '',
+};
+
+const $ = (id) => document.getElementById(id);
+
+function toast(msg, err=false) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.classList.toggle('err', err);
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2200);
+}
+
+async function loadEpisodes() {
+  const r = await fetch('/api/episodes');
+  if (!r.ok) throw new Error('failed to load: ' + r.status);
+  const data = await r.json();
+  state.datasetPath = data.dataset;
+  state.episodes = data.episodes;
+  state.cameras = data.cameras;
+  if (!state.activeCam || !state.cameras.includes(state.activeCam)) {
+    state.activeCam = state.cameras[0] || null;
+  }
+  $('dataset-meta').textContent =
+    `${data.dataset}  ·  ${data.total_episodes} episodes  ·  ${data.total_frames} frames  ·  ${data.fps} fps`;
+  renderTabs();
+  // clamp page if we lost episodes
+  const maxPage = Math.max(0, Math.ceil(state.episodes.length / PAGE_SIZE) - 1);
+  if (state.page > maxPage) state.page = maxPage;
+  render();
+}
+
+function renderTabs() {
+  const host = $('cam-tabs');
+  host.innerHTML = '';
+  if (state.cameras.length === 0) {
+    host.innerHTML = '<span class="meta">(无相机视频)</span>';
+    return;
+  }
+  for (const cam of state.cameras) {
+    const b = document.createElement('button');
+    b.className = 'tab' + (cam === state.activeCam ? ' active' : '');
+    b.textContent = cam.replace(/^observation\.images\./, '');
+    b.title = cam;
+    b.onclick = () => { state.activeCam = cam; renderTabs(); render(); };
+    host.appendChild(b);
+  }
+}
+
+function render() {
+  const total = state.episodes.length;
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  $('page-info').textContent = `第 ${state.page + 1} / ${totalPages} 页 · 共 ${total}`;
+  $('prev').disabled = state.page === 0;
+  $('next').disabled = state.page >= totalPages - 1;
+
+  const grid = $('grid');
+  grid.innerHTML = '';
+  const empty = $('empty');
+  if (total === 0) {
+    empty.style.display = 'block';
+    return;
+  }
+  empty.style.display = 'none';
+
+  const start = state.page * PAGE_SIZE;
+  const slice = state.episodes.slice(start, start + PAGE_SIZE);
+  for (const ep of slice) {
+    grid.appendChild(renderCard(ep));
+  }
+}
+
+function renderCard(ep) {
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.dataset.idx = ep.episode_index;
+
+  const head = document.createElement('div');
+  head.className = 'card-head';
+  const left = document.createElement('div');
+  left.innerHTML = `<span class="ep-num">Episode ${ep.episode_index}</span>
+    <span class="ep-len">  ${ep.length} 帧</span>`;
+  head.appendChild(left);
+  if (ep.discarded) {
+    const b = document.createElement('span');
+    b.className = 'badge';
+    b.textContent = 'discarded';
+    head.appendChild(b);
+  }
+  card.appendChild(head);
+
+  const vw = document.createElement('div');
+  vw.className = 'video-wrap';
+  const hasVid = state.activeCam && ep.available_cameras.includes(state.activeCam);
+  let video = null;
+  if (hasVid) {
+    video = document.createElement('video');
+    video.preload = 'metadata';
+    video.muted = true;
+    video.playsInline = true;
+    video.src = `/video/${encodeURIComponent(state.activeCam)}/${ep.episode_index}.mp4`;
+    vw.appendChild(video);
+  } else {
+    const n = document.createElement('div');
+    n.className = 'nodata';
+    n.textContent = state.activeCam
+      ? `(${state.activeCam} 视频缺失)`
+      : '(无可用相机)';
+    vw.appendChild(n);
+  }
+  card.appendChild(vw);
+
+  const ctrl = document.createElement('div');
+  ctrl.className = 'controls';
+  const mkBtn = (label, onClick, klass='') => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    if (klass) b.className = klass;
+    b.onclick = onClick;
+    return b;
+  };
+  ctrl.appendChild(mkBtn('▶ 播放', () => video && video.play()));
+  ctrl.appendChild(mkBtn('⏸ 暂停', () => video && video.pause()));
+  ctrl.appendChild(mkBtn('↻ 重播', () => {
+    if (!video) return;
+    video.currentTime = 0;
+    video.play();
+  }));
+  if (ep.discarded) {
+    ctrl.appendChild(mkBtn('↺ 取消 discard',
+      () => askToggle(ep.episode_index, false)));
+  } else {
+    ctrl.appendChild(mkBtn('✕ discard',
+      () => askToggle(ep.episode_index, true), 'danger'));
+  }
+  card.appendChild(ctrl);
+
+  const task = document.createElement('div');
+  task.className = 'task';
+  task.textContent = (ep.tasks || []).join(' · ') || '(无任务标签)';
+  card.appendChild(task);
+
+  return card;
+}
+
+function askToggle(idx, discarded) {
+  state.pending = { idx, discarded };
+  $('modal-idx').textContent = idx;
+  if (discarded) {
+    $('modal-title').innerHTML = `标记 Episode <span id="modal-idx">${idx}</span> 为 discard`;
+    $('modal-body').innerHTML = `把该 episode 的 index 写入 <code>info.json</code> 的
+      <code>discarded_episode_indices</code>（与采集时按 <code>x</code> 等价）。<br>
+      <strong>不动文件</strong>，训练加载器会跳过；之后还可以撤销。`;
+    $('modal-confirm').textContent = '标记为 discard';
+    $('modal-confirm').classList.add('danger');
+  } else {
+    $('modal-title').innerHTML = `取消 Episode <span id="modal-idx">${idx}</span> 的 discard 标记`;
+    $('modal-body').innerHTML = `把该 episode 从 <code>discarded_episode_indices</code> 中移除，训练加载器会重新加载它。`;
+    $('modal-confirm').textContent = '取消 discard';
+    $('modal-confirm').classList.remove('danger');
+  }
+  $('modal-bg').classList.add('open');
+}
+
+function closeModal() {
+  state.pending = null;
+  $('modal-bg').classList.remove('open');
+}
+
+async function confirmToggle() {
+  const p = state.pending;
+  closeModal();
+  if (!p) return;
+  const card = document.querySelector(`.card[data-idx="${p.idx}"]`);
+  if (card) card.classList.add('deleting');
+  try {
+    const r = await fetch(`/api/episodes/${p.idx}/discard`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ discarded: p.discarded }),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(t || r.status);
+    }
+    await r.json();
+    toast(p.discarded ? `已标记 episode ${p.idx} 为 discard` : `已取消 episode ${p.idx} 的 discard`);
+    await loadEpisodes();
+  } catch (e) {
+    toast(`操作失败: ${e.message}`, true);
+    if (card) card.classList.remove('deleting');
+  }
+}
+
+$('prev').onclick = () => { if (state.page > 0) { state.page--; render(); window.scrollTo(0, 0); } };
+$('next').onclick = () => {
+  const totalPages = Math.max(1, Math.ceil(state.episodes.length / PAGE_SIZE));
+  if (state.page < totalPages - 1) { state.page++; render(); window.scrollTo(0, 0); }
+};
+$('modal-cancel').onclick = closeModal;
+$('modal-confirm').onclick = confirmToggle;
+$('modal-bg').onclick = (e) => { if (e.target === $('modal-bg')) closeModal(); };
+
+loadEpisodes().catch(e => {
+  $('dataset-meta').textContent = 'error: ' + e.message;
+  toast('加载失败: ' + e.message, true);
+});
+</script>
+</body>
+</html>

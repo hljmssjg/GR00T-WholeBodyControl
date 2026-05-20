@@ -235,9 +235,11 @@ def validate_script_configs(dataset_paths: list[Path]) -> dict | None:
 def process_single_dataset(
     dataset_path: Path,
     remove_stale_smpl: bool,
+    drop_discarded: bool,
     episode_index_offset: int = 0,
 ) -> dict:
-    """Process one dataset: optionally clean stale SMPL frames.
+    """Process one dataset: optionally clean stale SMPL frames and drop
+    operator-flagged discarded episodes.
 
     Returns stats dict and the list of (parquet_df, video_paths, episode_meta)
     tuples for merging.
@@ -245,6 +247,7 @@ def process_single_dataset(
     info = load_info(dataset_path)
     episodes_meta = load_episodes_meta(dataset_path)
     fps = info.get("fps", 50)
+    discarded_set = set(info.get("discarded_episode_indices") or []) if drop_discarded else set()
 
     stats = {
         "total_episodes": len(episodes_meta),
@@ -254,11 +257,16 @@ def process_single_dataset(
         "zero_frames": 0,
         "frozen_leadin_frames": 0,
         "episodes_dropped": 0,
+        "episodes_discarded": 0,
     }
     processed_episodes = []
 
     for ep_meta in episodes_meta:
         ep_idx = ep_meta["episode_index"]
+        if ep_idx in discarded_set:
+            print(f"  Episode {ep_idx}: marked discarded — skipping")
+            stats["episodes_discarded"] += 1
+            continue
         parquet_path = get_parquet_path(dataset_path, info, ep_idx)
         video_paths = get_video_paths(dataset_path, info, ep_idx)
 
@@ -388,6 +396,9 @@ def write_output_dataset(
 
     info["total_episodes"] = len(all_episodes)
     info["total_frames"] = total_frames
+    info["total_videos"] = len(all_episodes) * len(get_video_keys(info))
+    info["splits"] = {"train": f"0:{info['total_episodes']}"}
+    info["discarded_episode_indices"] = []
 
     with open(meta_dir / "info.json", "w", encoding="utf-8") as f:
         json.dump(info, f, indent=4)
@@ -438,6 +449,11 @@ class ProcessDatasetConfig:
     """Remove frames where teleop.smpl_pose is all zeros (stale/dropped
     SMPL data) and frozen lead-in frames that precede them."""
 
+    drop_discarded: bool = True
+    """Drop episodes whose index appears in info.json:discarded_episode_indices
+    (operator pressed ``x`` during collection, or flagged in the episode
+    browser UI). On by default — set False to keep them."""
+
 
 def main(cfg: ProcessDatasetConfig):
     dataset_paths = [Path(p) for p in cfg.dataset_path]
@@ -479,6 +495,7 @@ def main(cfg: ProcessDatasetConfig):
         print(f"    - {ds}")
     print(f"  Output:               {output_path}{'  (in-place)' if in_place else ''}")
     print(f"  Remove stale SMPL:    {cfg.remove_stale_smpl}")
+    print(f"  Drop discarded eps:   {cfg.drop_discarded}")
     print("=" * 70)
 
     # Validate script configs match across all datasets
@@ -510,6 +527,7 @@ def main(cfg: ProcessDatasetConfig):
         "zero_frames": 0,
         "frozen_leadin_frames": 0,
         "episodes_dropped": 0,
+        "episodes_discarded": 0,
     }
     reference_info = None
 
@@ -518,6 +536,7 @@ def main(cfg: ProcessDatasetConfig):
         stats, episodes, info = process_single_dataset(
             ds_path,
             remove_stale_smpl=cfg.remove_stale_smpl,
+            drop_discarded=cfg.drop_discarded,
             episode_index_offset=len(all_episodes),
         )
 
@@ -534,11 +553,24 @@ def main(cfg: ProcessDatasetConfig):
 
     # Write output
     if in_place:
-        # In-place: rewrite parquet files and re-encode videos
+        # In-place: rewrite parquet files and re-encode videos. If episodes were
+        # dropped (SMPL-all-stale or discarded), renumber survivors to keep
+        # episodes.jsonl indices contiguous and unlink the orphan files.
         print(f"\nRewriting dataset in-place at {output_path}...")
         ds_info = load_info(output_path)
         fps = ds_info.get("fps", 50)
+        chunks_size = ds_info.get("chunks_size", 1000)
+        video_keys = get_video_keys(ds_info)
 
+        kept_source_indices = {ep["episode_meta"]["episode_index"] for ep in all_episodes}
+        prior_meta = load_episodes_meta(output_path)
+        dropped_source_indices = [
+            em["episode_index"] for em in prior_meta
+            if em["episode_index"] not in kept_source_indices
+        ]
+        renumber = len(dropped_source_indices) > 0
+
+        # Step 1: write surviving parquet (in source-index slot) and filter video frames.
         for ep in all_episodes:
             ep_idx = ep["episode_meta"]["episode_index"]
             parquet_path = get_parquet_path(output_path, ds_info, ep_idx)
@@ -550,11 +582,68 @@ def main(cfg: ProcessDatasetConfig):
                     if vpath.exists():
                         filter_video_frames(vpath, ep["valid_indices"], fps)
 
-        # Update episode metadata
+        # Step 2: unlink orphan files for episodes that were dropped.
+        for old_idx in dropped_source_indices:
+            pq = get_parquet_path(output_path, ds_info, old_idx)
+            if pq.exists():
+                pq.unlink()
+            for _vkey, vpath in get_video_paths(output_path, ds_info, old_idx).items():
+                if vpath.exists():
+                    vpath.unlink()
+
+        # Step 3: renumber survivors 0..N-1 if there were gaps.
+        sorted_eps = sorted(all_episodes, key=lambda e: e["episode_meta"]["episode_index"])
+        if renumber:
+            import pandas as pd
+
+            # Pass 1: rename all files to a temp suffix so new and old slots can't collide.
+            tmp_suffix = ".__renum__"
+            for new_idx, ep in enumerate(sorted_eps):
+                old_idx = ep["episode_meta"]["episode_index"]
+                if new_idx == old_idx:
+                    continue
+                old_pq = get_parquet_path(output_path, ds_info, old_idx)
+                if old_pq.exists():
+                    old_pq.rename(old_pq.with_name(old_pq.name + tmp_suffix))
+                for _vkey, old_v in get_video_paths(output_path, ds_info, old_idx).items():
+                    if old_v.exists():
+                        old_v.rename(old_v.with_name(old_v.name + tmp_suffix))
+
+            # Pass 2: temp → final (rewriting parquet columns).
+            total_frames_running = 0
+            for new_idx, ep in enumerate(sorted_eps):
+                old_idx = ep["episode_meta"]["episode_index"]
+                ep_len = len(ep["df"])
+                if new_idx != old_idx:
+                    old_pq = get_parquet_path(output_path, ds_info, old_idx)
+                    tmp_pq = old_pq.with_name(old_pq.name + tmp_suffix)
+                    new_pq = get_parquet_path(output_path, ds_info, new_idx)
+                    new_pq.parent.mkdir(parents=True, exist_ok=True)
+                    if tmp_pq.exists():
+                        df = pd.read_parquet(tmp_pq)
+                        df["episode_index"] = new_idx
+                        df["index"] = range(total_frames_running, total_frames_running + ep_len)
+                        df["frame_index"] = range(ep_len)
+                        df.to_parquet(new_pq)
+                        tmp_pq.unlink()
+
+                    old_video_paths = get_video_paths(output_path, ds_info, old_idx)
+                    new_video_paths = get_video_paths(output_path, ds_info, new_idx)
+                    for vkey, old_v in old_video_paths.items():
+                        tmp_v = old_v.with_name(old_v.name + tmp_suffix)
+                        if tmp_v.exists():
+                            new_v = new_video_paths[vkey]
+                            new_v.parent.mkdir(parents=True, exist_ok=True)
+                            tmp_v.rename(new_v)
+                total_frames_running += ep_len
+
+        # Update episode metadata (sorted, renumbered if needed).
         episodes_meta = []
-        for ep in all_episodes:
+        for new_idx, ep in enumerate(sorted_eps):
             meta = ep["episode_meta"].copy()
             meta["length"] = len(ep["df"])
+            if renumber:
+                meta["episode_index"] = new_idx
             episodes_meta.append(meta)
 
         with open(output_path / "meta" / "episodes.jsonl", "w", encoding="utf-8") as f:
@@ -563,8 +652,35 @@ def main(cfg: ProcessDatasetConfig):
 
         ds_info["total_frames"] = sum(len(ep["df"]) for ep in all_episodes)
         ds_info["total_episodes"] = len(all_episodes)
+        ds_info["total_videos"] = len(all_episodes) * len(video_keys)
+        ds_info["splits"] = {"train": f"0:{ds_info['total_episodes']}"}
+        ds_info["discarded_episode_indices"] = []
         with open(output_path / "meta" / "info.json", "w", encoding="utf-8") as f:
             json.dump(ds_info, f, indent=4)
+
+        # Also rewrite episodes_stats.jsonl if present, dropping orphan rows
+        # and renumbering to match.
+        stats_path = output_path / "meta" / "episodes_stats.jsonl"
+        if stats_path.exists():
+            old_stats = {}
+            for line in stats_path.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                old_stats[row["episode_index"]] = row
+            new_stats_rows = []
+            for new_idx, ep in enumerate(sorted_eps):
+                old_idx = ep["episode_meta"]["episode_index"]
+                row = old_stats.get(old_idx)
+                if row is None:
+                    continue
+                if renumber:
+                    row = {**row, "episode_index": new_idx}
+                new_stats_rows.append(row)
+            with stats_path.open("w", encoding="utf-8") as f:
+                for r in new_stats_rows:
+                    f.write(json.dumps(r) + "\n")
     else:
         print(f"\nWriting output dataset to {output_path}...")
         write_output_dataset(
@@ -574,13 +690,20 @@ def main(cfg: ProcessDatasetConfig):
 
     # Print summary
     kept = total_stats["total_frames"] - total_stats["frames_removed"]
-    kept_episodes = total_stats["total_episodes"] - total_stats["episodes_dropped"]
+    kept_episodes = (
+        total_stats["total_episodes"]
+        - total_stats["episodes_dropped"]
+        - total_stats["episodes_discarded"]
+    )
 
     print("\n" + "=" * 70)
     print("  Processing complete!")
     print("=" * 70)
-    print(f"  Episodes:  {kept_episodes} kept / {total_stats['total_episodes']} total"
-          f"  ({total_stats['episodes_dropped']} dropped)")
+    print(
+        f"  Episodes:  {kept_episodes} kept / {total_stats['total_episodes']} total  "
+        f"({total_stats['episodes_discarded']} discarded, "
+        f"{total_stats['episodes_dropped']} all-stale dropped)"
+    )
     print(f"  Frames:    {kept} kept / {total_stats['total_frames']} total"
           f"  ({total_stats['frames_removed']} removed)")
     if total_stats["frames_removed"] > 0:

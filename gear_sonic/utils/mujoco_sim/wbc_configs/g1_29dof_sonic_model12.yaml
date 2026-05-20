@@ -1,6 +1,7 @@
 # copy from g1_43dof_hist.yaml
 ROBOT_TYPE: 'g1_29dof' # Robot name, "go2", "b2", "b2w", "h1", "go2w", "g1" 
-ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/g1/scene_43dof_pick_apple.xml" # Robot scene with table + apple + start anchor (pick-apple task)
+ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/g1/scene_43dof_pick_jug.xml" # Robot scene with table + jug (handle, grippy) + start anchor (pick-jug task)
+# ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/g1/scene_43dof_pick_apple.xml" # earlier pick-apple variant; apple too small/slippery, kept for reference
 # ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/g1/scene_43dof.xml" # original empty world; flip back here to rollback
 # ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/g1/scene_29dof_activated3dex.xml"
 

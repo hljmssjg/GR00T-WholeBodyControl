@@ -1743,7 +1743,7 @@ class PlannerStreamer:
                 mode_to_send = self.mode
 
                 if self.mode == LocomotionMode.SLOW_WALK:
-                    speed = 0.1 + 0.5 * mag  # 0.1 .. 0.6
+                    speed = 0.05 + 0.2 * mag  # 0.05 .. 0.25
                 elif self.mode == LocomotionMode.WALK:
                     speed = -1.0
                 elif self.mode == LocomotionMode.RUN:

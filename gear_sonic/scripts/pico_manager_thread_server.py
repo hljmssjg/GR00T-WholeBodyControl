@@ -1653,6 +1653,7 @@ class PlannerStreamer:
         poll_hz: int = 20,
         zmq_feedback_host: str = "localhost",
         zmq_feedback_port: int = 5557,
+        stick_click_forward: bool = False,
     ):
         self.socket = socket
         self.reader = reader
@@ -1673,6 +1674,10 @@ class PlannerStreamer:
 
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+
+        self.stick_click_forward = stick_click_forward
+        if stick_click_forward:
+            print("[PlannerLoop] Stick-click forward enabled: press LEFT stick to walk forward")
 
     def reset_yaw(self):
         """Called when entering planner mode. Resets state for fresh start."""
@@ -1726,6 +1731,15 @@ class PlannerStreamer:
 
             # Read axes/joysticks to control movement, facing, speed and mode
             lx, ly, rx, ry = get_controller_axes()
+
+            # Press LEFT stick = walk straight forward at max stick magnitude.
+            # Bypasses physical-stick angular bias on Quest. Only enabled when
+            # the outer loop is in --force-vr-3pt mode (otherwise left_axis_click
+            # is reserved for PLANNER <-> VR_3PT toggling in the Manager loop).
+            if self.stick_click_forward:
+                left_click, _ = get_axis_clicks()
+                if left_click:
+                    lx, ly = 0.0, 1.0
 
             # Facing from RIGHT stick: continuous yaw based on rx (right = turn right, left = turn left)
             facing = self.yaw_accumulator.update(rx, self.dt)
@@ -1907,6 +1921,7 @@ def run_pico_manager(
         poll_hz=20,
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
+        stick_click_forward=force_vr_3pt,
     )
 
     # State machine diagram:

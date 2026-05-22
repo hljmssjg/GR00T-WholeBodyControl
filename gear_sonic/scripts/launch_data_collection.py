@@ -153,6 +153,14 @@ class DataCollectionLaunchConfig:
     text_to_speech: bool = True
     """Enable voice feedback via espeak (data exporter)."""
 
+    tts_backend: str = "espeak"
+    """Voice backend: 'espeak' (PC speaker) or 'g1' (robot's onboard speaker,
+    hands-free for the operator; reads Chinese)."""
+
+    tts_g1_iface: str = "enp2s0"
+    """Network interface that reaches the G1 (192.168.123.x). Only used when
+    tts_backend='g1'."""
+
     # Camera viewer
     camera_viewer: bool = True
     """Start the camera viewer pane."""
@@ -428,6 +436,8 @@ def main(config: DataCollectionLaunchConfig):
         exporter_cmd += " --record-wrist-cameras"
     if not config.text_to_speech:
         exporter_cmd += " --no-text-to-speech"
+    exporter_cmd += f" --tts-backend {config.tts_backend}"
+    exporter_cmd += f" --tts-g1-iface {config.tts_g1_iface}"
 
     print("Starting data exporter (pane 1)...")
     _send_to_pane(2, exporter_cmd, wait=1.0)

@@ -768,6 +768,47 @@ def _quat_lerp_normalized(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.nd
     return q
 
 
+def _snapshot_complete(snap: dict | None) -> bool:
+    """All four upper-body command channels (vr_position, vr_orientation, lh, rh)
+    must be present for the blend helper to interpolate them."""
+    if snap is None:
+        return False
+    return all(snap.get(k) is not None for k in ("vr_position", "vr_orientation", "lh", "rh"))
+
+
+def _blend_3pt_snapshot(snap_from: dict, snap_to: dict, alpha: float) -> dict:
+    """Interpolate two upper-body snapshots ({vr_position[9], vr_orientation[12],
+    lh[7], rh[7]}) by ``alpha`` in [0,1]. Positions and hand 7-vectors lerp;
+    the three keypoint quaternions in ``vr_orientation`` slerp (scalar-first
+    [qw,qx,qy,qz])."""
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+
+    fp = np.asarray(snap_from["vr_position"], dtype=np.float32).reshape(-1)
+    tp = np.asarray(snap_to["vr_position"], dtype=np.float32).reshape(-1)
+    pos = ((1.0 - alpha) * fp + alpha * tp).tolist()
+
+    fo = np.asarray(snap_from["vr_orientation"], dtype=np.float32).reshape(-1, 4)
+    to_ = np.asarray(snap_to["vr_orientation"], dtype=np.float32).reshape(-1, 4)
+    blended_q = np.empty_like(fo)
+    for i in range(fo.shape[0]):
+        # _quat_lerp_normalized expects xyzw; the snapshot stores wxyz.
+        q0 = np.array([fo[i, 1], fo[i, 2], fo[i, 3], fo[i, 0]])
+        q1 = np.array([to_[i, 1], to_[i, 2], to_[i, 3], to_[i, 0]])
+        q = _quat_lerp_normalized(q0, q1, alpha)
+        blended_q[i] = [q[3], q[0], q[1], q[2]]
+    ori = blended_q.flatten().tolist()
+
+    fl = np.asarray(snap_from["lh"], dtype=np.float32).reshape(-1)
+    tl = np.asarray(snap_to["lh"], dtype=np.float32).reshape(-1)
+    lh = ((1.0 - alpha) * fl + alpha * tl).tolist()
+
+    fr = np.asarray(snap_from["rh"], dtype=np.float32).reshape(-1)
+    tr = np.asarray(snap_to["rh"], dtype=np.float32).reshape(-1)
+    rh = ((1.0 - alpha) * fr + alpha * tr).tolist()
+
+    return {"vr_position": pos, "vr_orientation": ori, "lh": lh, "rh": rh}
+
+
 def _interp_pose_axis_angle(
     prev_pose: np.ndarray, curr_pose: np.ndarray, alpha: float
 ) -> np.ndarray:
@@ -1747,6 +1788,20 @@ class PlannerStreamer:
         self._override_was_active = False
         self._yaw_lock = None  # list[float] of length 3, set at override-rising edge
 
+        # ---- Blend (smooth handover at engage / disengage edges) ----
+        # On the rising edge of override_active we want to ease the upper body
+        # from the operator's current live pose into the locked snapshot; on the
+        # falling edge, ease back from the snapshot to live tracking. Without
+        # this blend the upper body snaps in/out, which is jarring and unsafe
+        # near a table. ``_blend_from`` is a frozen snapshot-shaped dict captured
+        # at the edge; ``_last_emitted`` lets mid-blend edge flips start from
+        # what was actually published last frame instead of jumping.
+        self._blend_state = None  # None | "engage" | "disengage"
+        self._blend_end_t = 0.0  # monotonic deadline
+        self._blend_duration = 1.0  # seconds — chosen for "slow but not draggy"
+        self._blend_from = None
+        self._last_emitted = None
+
     INIT_POSE_PATH = (
         Path(__file__).resolve().parent.parent
         / "data"
@@ -1959,9 +2014,11 @@ class PlannerStreamer:
                 self._capture_autopilot_snapshot(stream_mode)
             elif (not autopilot_engaged) and self._autopilot_was_active:
                 # Operator is taking over: re-zero VR tracking to their current pose.
+                # NOTE: don't clear _autopilot_snapshot here — the override falling
+                # edge below needs it to seed the disengage blend. The snapshot is
+                # cleared there once blend_from has captured it.
                 if stream_mode == StreamMode.PLANNER_VR_3PT:
                     self.recalibrate_for_vr3pt()
-                self._autopilot_snapshot = None
                 print("[PlannerLoop] Autopilot DISENGAGED — recalibrated VR 3PT")
             self._autopilot_was_active = autopilot_engaged
 
@@ -1985,8 +2042,41 @@ class PlannerStreamer:
                     self._capture_autopilot_snapshot(stream_mode)
                     print("[PlannerLoop] Override ENGAGED — captured current pose (no init_pose.json)")
                 self._yaw_lock = list(self.yaw_accumulator.heading)
+                # Kick off engage blend: start from whatever was actually emitted
+                # last frame (live VR pose, or a mid-blend output if an edge flips
+                # twice fast); target is the freshly-installed snapshot.
+                blend_from = self._last_emitted or self._build_current_snapshot(stream_mode)
+                if (
+                    stream_mode == StreamMode.PLANNER_VR_3PT
+                    and _snapshot_complete(blend_from)
+                    and _snapshot_complete(self._autopilot_snapshot)
+                ):
+                    self._blend_from = dict(blend_from)
+                    self._blend_state = "engage"
+                    self._blend_end_t = time.monotonic() + self._blend_duration
+                    print(f"[PlannerLoop] Engage blend started ({self._blend_duration:.2f}s)")
+                else:
+                    # Either not in VR_3PT or no usable from/to — skip blend, snap as before.
+                    self._blend_state = None
+                    self._blend_from = None
             elif (not override_active) and self._override_was_active:
                 self._yaw_lock = None
+                # Kick off disengage blend: start from last emitted (the held
+                # snapshot pose, or a mid-blend output); target is computed live
+                # each frame inside the VR_3PT branch.
+                blend_from = self._last_emitted or self._autopilot_snapshot
+                if (
+                    stream_mode == StreamMode.PLANNER_VR_3PT
+                    and _snapshot_complete(blend_from)
+                ):
+                    self._blend_from = dict(blend_from)
+                    self._blend_state = "disengage"
+                    self._blend_end_t = time.monotonic() + self._blend_duration
+                    print(f"[PlannerLoop] Disengage blend started ({self._blend_duration:.2f}s)")
+                else:
+                    self._blend_state = None
+                    self._blend_from = None
+                self._autopilot_snapshot = None
                 print("[PlannerLoop] Override DISENGAGED — yaw unlocked")
             self._override_was_active = override_active
 
@@ -2022,6 +2112,21 @@ class PlannerStreamer:
                 else:
                     speed = mag  # default 0 .. 1.0
 
+            # Speed boosts to beat the real robot's "steps in place at low speed"
+            # behaviour: it only translates above a speed the model learned, and
+            # below it just lifts its feet. We multiply the speed number by 1.5 in
+            # the two cases where it otherwise falls short. Skip the WALK sentinel
+            # (-1.0 = "use the model's default speed") so we don't make it -1.5.
+            if speed > 0.0:
+                if self._walk_straight_mode == "forward":
+                    # Forward recording — boost gets baked into the saved clip.
+                    speed *= 1.5
+                elif self._walk_straight_mode is None and ly < 0.0:
+                    # Manual stick backward: the stick rarely pushes to full and
+                    # is biased, so backing up otherwise just marches in place.
+                    # (Autopilot/recorded backward already moves fine — untouched.)
+                    speed *= 1.5
+
             denom = raw_mag if raw_mag > 0.0 else 1.0
             scale = mag / denom
             movement_local = np.array([-lx, ly]) * scale
@@ -2053,7 +2158,76 @@ class PlannerStreamer:
             vr_3pt_orientation = None
             vr_3pt_compliance = None
             if stream_mode == StreamMode.PLANNER_VR_3PT:
-                if override_active and self._autopilot_snapshot is not None:
+                now_t = time.monotonic()
+                blend_active = (
+                    self._blend_state is not None
+                    and now_t < self._blend_end_t
+                    and _snapshot_complete(self._blend_from)
+                )
+                if self._blend_state is not None and not blend_active:
+                    # Window expired or from-side disappeared — drop blend state.
+                    self._blend_state = None
+                    self._blend_from = None
+
+                # Live pose is required when: no override is active (operator in
+                # control) OR we're easing out during a disengage blend. Engage
+                # blends don't need it — the target is the snapshot.
+                need_live = (not override_active) or (
+                    blend_active and self._blend_state == "disengage"
+                )
+                live_pose = None
+                if need_live:
+                    sample = self.reader.get_latest()
+                    if sample is not None:
+                        if not hasattr(self, "_last_vr3pt_print_t") or (
+                            now_t - self._last_vr3pt_print_t > 5.0
+                        ):
+                            print("[PlannerLoop] Sending VR 3-point pose as target (throttled, 5s)")
+                            self._last_vr3pt_print_t = now_t
+                        vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
+                        (
+                            _left_menu_button,
+                            left_trigger,
+                            right_trigger,
+                            left_grip,
+                            right_grip,
+                        ) = get_controller_inputs()
+                        lh_joints, rh_joints = compute_hand_joints_from_inputs(
+                            self.left_hand_ik_solver,
+                            self.right_hand_ik_solver,
+                            left_trigger,
+                            left_grip,
+                            right_trigger,
+                            right_grip,
+                        )
+                        live_pose = {
+                            "vr_position": vr_3pt_pose[:, :3].flatten().tolist(),
+                            "vr_orientation": vr_3pt_pose[:, 3:].flatten().tolist(),
+                            "lh": lh_joints.reshape(-1).astype(np.float32).tolist(),
+                            "rh": rh_joints.reshape(-1).astype(np.float32).tolist(),
+                        }
+
+                if blend_active:
+                    alpha = 1.0 - (self._blend_end_t - now_t) / self._blend_duration
+                    if self._blend_state == "engage":
+                        to_p = self._autopilot_snapshot
+                    else:  # "disengage"
+                        to_p = live_pose
+                    if _snapshot_complete(to_p):
+                        blended = _blend_3pt_snapshot(self._blend_from, to_p, alpha)
+                        vr_3pt_position = blended["vr_position"]
+                        vr_3pt_orientation = blended["vr_orientation"]
+                        left_hand_position = blended["lh"]
+                        right_hand_position = blended["rh"]
+                    else:
+                        # Target dropped out (e.g. snapshot cleared mid-engage,
+                        # or no VR sample mid-disengage). Hold the blend_from
+                        # pose for this frame instead of producing a jump.
+                        vr_3pt_position = self._blend_from["vr_position"]
+                        vr_3pt_orientation = self._blend_from["vr_orientation"]
+                        left_hand_position = self._blend_from["lh"]
+                        right_hand_position = self._blend_from["rh"]
+                elif override_active and self._autopilot_snapshot is not None:
                     # Hold the init / snapshotted pose so the operator can
                     # drop arms / adjust HMD. Triggered by replay or by a
                     # record+walk toggle (right_grip+A / right_grip+B).
@@ -2061,25 +2235,16 @@ class PlannerStreamer:
                     vr_3pt_orientation = self._autopilot_snapshot.get("vr_orientation")
                     left_hand_position = self._autopilot_snapshot.get("lh")
                     right_hand_position = self._autopilot_snapshot.get("rh")
+                elif live_pose is not None:
+                    vr_3pt_position = live_pose["vr_position"]
+                    vr_3pt_orientation = live_pose["vr_orientation"]
+                    left_hand_position = live_pose["lh"]
+                    right_hand_position = live_pose["rh"]
                 else:
-                    sample = self.reader.get_latest()
-                    if sample is not None:
-                        # Throttle: this used to print every loop iteration (20Hz)
-                        # which buried other logs. Now print at most once every 5s.
-                        now_t = time.monotonic()
-                        if not hasattr(self, "_last_vr3pt_print_t") or (
-                            now_t - self._last_vr3pt_print_t > 5.0
-                        ):
-                            print("[PlannerLoop] Sending VR 3-point pose as target (throttled, 5s)")
-                            self._last_vr3pt_print_t = now_t
-                        vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
-                        vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
-                        vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
-
-                    # Compute hand joints from trigger/grip inputs so operator can
-                    # control hand open/close while in VR 3PT mode
+                    # No live sample yet — still publish hand commands so the
+                    # operator can open/close grippers; leave vr targets as None.
                     (
-                        left_menu_button,
+                        _left_menu_button,
                         left_trigger,
                         right_trigger,
                         left_grip,
@@ -2095,6 +2260,21 @@ class PlannerStreamer:
                     )
                     left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
                     right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
+
+                # Record what we actually emitted so a mid-blend edge flip can
+                # start from the published pose rather than jumping back to live.
+                if (
+                    vr_3pt_position is not None
+                    and vr_3pt_orientation is not None
+                    and left_hand_position is not None
+                    and right_hand_position is not None
+                ):
+                    self._last_emitted = {
+                        "vr_position": list(vr_3pt_position),
+                        "vr_orientation": list(vr_3pt_orientation),
+                        "lh": list(left_hand_position),
+                        "rh": list(right_hand_position),
+                    }
 
             msg = build_planner_message(
                 mode_to_send.value,

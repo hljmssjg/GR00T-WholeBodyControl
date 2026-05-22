@@ -103,6 +103,14 @@ class SonicDataExporterConfig:
     text_to_speech: bool = True
     """Use text-to-speech voice feedback."""
 
+    tts_backend: str = "espeak"
+    """Voice backend: 'espeak' (PC speaker) or 'g1' (robot's onboard speaker,
+    hands-free for the teleop operator; reads Chinese)."""
+
+    tts_g1_iface: str = "enp2s0"
+    """Network interface that reaches the G1 (192.168.123.x). Only used when
+    tts_backend='g1'."""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -321,18 +329,18 @@ class GrootDataCollector:
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self._initial_yaw = None
                 self._print_and_say(
-                    f"Started recording {self.current_episode_index}", blocking=False
+                    f"开始录制第 {self.current_episode_index} 条", blocking=False
                 )
             elif self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
-                self._print_and_say("Stopping recording, preparing to save", blocking=False)
+                self._print_and_say("停止录制，正在保存", blocking=False)
             elif self._episode_state.get_state() == self._episode_state.IDLE:
-                self._print_and_say("Saved episode and back to idle state", blocking=False)
+                self._print_and_say("已保存，回到待机", blocking=False)
         elif key == "x":
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self.data_exporter.save_episode_as_discarded()
                 self._episode_state.reset_state()
                 self._initial_yaw = None
-                self._print_and_say("Discarded episode", blocking=False)
+                self._print_and_say("已丢弃这一条", blocking=False)
 
     def _poll_sonic_zmq_messages(self):
         """Poll ZMQ for pose, planner, and manager_state messages (non-blocking)."""
@@ -548,7 +556,7 @@ class GrootDataCollector:
                 self.data_exporter.save_episode()
                 self.sonic_timing_monitor.reset()
                 self._initial_yaw = None
-                self._print_and_say("Finished saving episode")
+                self._print_and_say("本条保存完成")
             else:
                 self._print_and_say("Skipping save: no frames collected", say=False)
             self._episode_state.change_state()
@@ -830,7 +838,7 @@ class GrootDataCollector:
 
     def save_and_cleanup(self):
         try:
-            self._print_and_say("saving episode done", blocking=False)
+            self._print_and_say("正在保存收尾", blocking=False)
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
                 self.data_exporter.save_episode()
@@ -838,7 +846,10 @@ class GrootDataCollector:
                 f"Recording complete: {self.data_exporter.meta.root}", say=False, blocking=True
             )
         except Exception as e:
-            self._print_and_say(f"Error saving episode: {e}", blocking=True)
+            # Print the full (English) error for the console, but speak a short
+            # Chinese line — the G1 voice would garble the raw exception text.
+            print(f"Error saving episode: {e}")
+            self._print_and_say("保存出错", blocking=True)
 
         try:
             self._state_subscriber.close()
@@ -924,7 +935,11 @@ def main(config: SonicDataExporterConfig):
             else:
                 modality_config[key] = value
 
-    text_to_speech = TextToSpeech() if config.text_to_speech else None
+    text_to_speech = (
+        TextToSpeech(backend=config.tts_backend, g1_iface=config.tts_g1_iface)
+        if config.text_to_speech
+        else None
+    )
 
     robot_config = poll_robot_config_zmq(
         config.state_zmq_host, config.state_zmq_port, config.robot_config_timeout

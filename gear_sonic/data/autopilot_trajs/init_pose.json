@@ -1,0 +1,21 @@
+{
+  "vr_3pt_position": [
+    0.30,  0.18, 0.20,
+    0.30, -0.18, 0.20,
+    0.00,  0.00, 0.50
+  ],
+  "vr_3pt_orientation": [
+    1.0, 0.0, 0.0, 0.0,
+    1.0, 0.0, 0.0, 0.0,
+    1.0, 0.0, 0.0, 0.0
+  ],
+  "lh_joints": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+  "rh_joints": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+  "_source": "manually committed — G1 hands-held-forward at chest height (rel pelvis), identity wrist+neck quat, open hands",
+  "_layout": {
+    "vr_3pt_position": "[L_wrist_xyz, R_wrist_xyz, Neck_xyz] in robot frame relative to pelvis (meters)",
+    "vr_3pt_orientation": "[L_wrist_wxyz, R_wrist_wxyz, Neck_wxyz] quat in robot frame relative to pelvis",
+    "lh_joints": "left hand 7 joint angles, zeros = open",
+    "rh_joints": "right hand 7 joint angles, zeros = open"
+  }
+}

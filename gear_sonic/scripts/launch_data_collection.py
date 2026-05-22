@@ -130,6 +130,13 @@ class DataCollectionLaunchConfig:
     Required for the Quest backend (no full-SMPL data). Set False only when running
     XR_BACKEND=pico with the XRoboToolkit SDK."""
 
+    autopilot: bool = False
+    """Launch auto_pilot.py --play in its own tmux window so stick clicks can
+    drive recorded walk-to-table / return-to-start trajectories."""
+
+    autopilot_port: int = 5558
+    """ZMQ PUB port auto_pilot.py uses for autopilot_cmd + reset_cmd."""
+
     # Data exporter options
     task_prompt: str = "demo"
     """Language task prompt for the data exporter."""
@@ -304,6 +311,25 @@ def main(config: DataCollectionLaunchConfig):
     _create_tmux_session()
     print(f"Created tmux session: {SESSION_NAME}")
 
+    # --- Window 'autopilot' (when --autopilot): auto_pilot.py --play ---
+    if config.autopilot:
+        subprocess.run(
+            ["tmux", "new-window", "-t", SESSION_NAME, "-n", "autopilot"],
+        )
+        autopilot_cmd = (
+            f"cd {repo_root} && "
+            f"source .venv_teleop/bin/activate && "
+            f"python gear_sonic/scripts/auto_pilot.py --play "
+            f"--publish-port {config.autopilot_port}"
+        )
+        ap_target = f"{SESSION_NAME}:autopilot"
+        subprocess.run(["tmux", "send-keys", "-t", ap_target, autopilot_cmd, "C-m"])
+        print("Starting autopilot (window: autopilot)...")
+        time.sleep(0.5)
+        subprocess.run(
+            ["tmux", "select-window", "-t", f"{SESSION_NAME}:data_collection"],
+        )
+
     # --- Window 1 (sim only): MuJoCo Simulator ---
     if config.sim:
         subprocess.run(
@@ -420,6 +446,10 @@ def main(config: DataCollectionLaunchConfig):
     if config.sim:
         print("  Window 'sim':")
         print("    MuJoCo Simulator (.venv_sim)")
+        print()
+    if config.autopilot:
+        print("  Window 'autopilot':")
+        print("    auto_pilot.py --play (.venv_teleop)")
         print()
     print("  Window 'data_collection':")
     print("    Pane 0 (top-left):     C++ Deploy")

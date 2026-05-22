@@ -344,3 +344,12 @@ class SimLoopConfig(BaseConfig):
 
     verbose: bool = False
     """Verbose output, override the base config verbose"""
+
+    enable_autopilot_reset: bool = True
+    """Subscribe to auto_pilot.py's reset_cmd and call sim_env.reset() on receipt."""
+
+    autopilot_host: str = "localhost"
+    """Host to subscribe to for autopilot's reset_cmd messages."""
+
+    autopilot_port: int = 5558
+    """Port to subscribe to for autopilot's reset_cmd messages."""

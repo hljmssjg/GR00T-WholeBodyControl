@@ -4,9 +4,12 @@ Parses a YAML-based WBC config via tyro CLI, instantiates the G1 robot model,
 and launches the simulator (optionally with offscreen image publishing).
 """
 
+import threading
+import time
 from typing import Dict
 
 import tyro
+import zmq
 
 from gear_sonic.utils.mujoco_sim.simulator_factory import SimulatorFactory, init_channel
 from gear_sonic.utils.mujoco_sim.configs import SimLoopConfig
@@ -16,6 +19,38 @@ from gear_sonic.data.robot_model.instantiation.g1 import (
 from gear_sonic.data.robot_model.robot_model import RobotModel
 
 ArgsConfig = SimLoopConfig
+
+
+def _start_reset_listener(sim_wrapper: "SimWrapper", host: str, port: int) -> threading.Thread:
+    """Subscribe to autopilot's reset_cmd topic; call sim_env.reset() on receipt.
+
+    Runs in a daemon thread. ``sim_env.reset`` is a thin ``mj_resetData`` wrapper;
+    calling it concurrently with ``mj_step`` is a fast pointer-level overwrite,
+    which for sim use is fine — the worst case is one transient step where the
+    model snapshot straddles the reset.
+    """
+
+    def _run() -> None:
+        ctx = zmq.Context.instance()
+        sub = ctx.socket(zmq.SUB)
+        sub.connect(f"tcp://{host}:{port}")
+        sub.setsockopt(zmq.SUBSCRIBE, b"reset_cmd")
+        print(f"[run_sim_loop] reset listener attached to tcp://{host}:{port}/reset_cmd")
+        while True:
+            try:
+                _ = sub.recv()
+            except Exception:
+                time.sleep(0.5)
+                continue
+            try:
+                sim_wrapper.sim.reset()
+                print("[run_sim_loop] reset_cmd received — sim_env.reset() done")
+            except Exception as e:
+                print(f"[run_sim_loop] reset failed: {e}")
+
+    t = threading.Thread(target=_run, name="reset-listener", daemon=True)
+    t.start()
+    return t
 
 
 class SimWrapper:
@@ -53,6 +88,12 @@ def main(config: ArgsConfig):
         offscreen=wbc_config.get("ENABLE_OFFSCREEN", False),
         enable_image_publish=config.enable_image_publish,
     )
+    if config.enable_autopilot_reset:
+        _start_reset_listener(
+            sim_wrapper,
+            host=config.autopilot_host,
+            port=config.autopilot_port,
+        )
     # Start simulator as independent process
     SimulatorFactory.start_simulator(
         sim_wrapper.sim,

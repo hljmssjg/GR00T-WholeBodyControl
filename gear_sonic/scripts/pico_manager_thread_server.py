@@ -24,6 +24,7 @@
 
 from collections import defaultdict, deque
 from enum import Enum, IntEnum
+from pathlib import Path
 import os
 import subprocess
 import threading
@@ -523,6 +524,42 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
 
 # Joystick deadzone threshold
 JOYSTICK_DEADZONE = 0.15
+
+
+_ZMQ_HEADER_SIZE = 1280
+_ZMQ_DTYPE_MAP = {
+    "f32": np.float32,
+    "f64": np.float64,
+    "i32": np.int32,
+    "i64": np.int64,
+    "bool": np.bool_,
+}
+
+
+def unpack_pose_message_inline(packed: bytes, topic: str) -> dict:
+    """Decode messages built by pack_pose_message (mirror of run_data_exporter's helper)."""
+    import json as _json
+
+    topic_bytes = topic.encode("utf-8")
+    if not packed.startswith(topic_bytes):
+        raise ValueError(f"topic mismatch: expected {topic!r}")
+    offset = len(topic_bytes)
+    blob = packed[offset : offset + _ZMQ_HEADER_SIZE]
+    null = blob.find(b"\x00")
+    if null >= 0:
+        blob = blob[:null]
+    header = _json.loads(blob.decode("utf-8"))
+    out = {}
+    cursor = offset + _ZMQ_HEADER_SIZE
+    for field in header.get("fields", []):
+        dtype = _ZMQ_DTYPE_MAP.get(field["dtype"], np.float32)
+        shape = tuple(field["shape"])
+        nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+        out[field["name"]] = (
+            np.frombuffer(packed[cursor : cursor + nbytes], dtype=dtype).reshape(shape).copy()
+        )
+        cursor += nbytes
+    return out
 
 
 class YawAccumulator:
@@ -1653,7 +1690,9 @@ class PlannerStreamer:
         poll_hz: int = 20,
         zmq_feedback_host: str = "localhost",
         zmq_feedback_port: int = 5557,
-        stick_click_forward: bool = False,
+        autopilot_host: str = "localhost",
+        autopilot_port: int = 5558,
+        deadman_threshold: float = 0.3,
     ):
         self.socket = socket
         self.reader = reader
@@ -1675,9 +1714,77 @@ class PlannerStreamer:
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
 
-        self.stick_click_forward = stick_click_forward
-        if stick_click_forward:
-            print("[PlannerLoop] Stick-click forward enabled: press LEFT stick to walk forward")
+        # ---- Autopilot subscription ----
+        # When auto_pilot.py is running it publishes on autopilot_cmd; we listen
+        # and, while it's active, override lx/ly/facing/mode and freeze the
+        # upper body to a snapshot. Joystick |raw_mag| > deadman_threshold acts
+        # as a deadman: planner ignores autopilot and we tell the manager to
+        # publish a cancel request so autopilot disengages.
+        self._autopilot_ctx = zmq.Context.instance()
+        self._autopilot_sub = self._autopilot_ctx.socket(zmq.SUB)
+        self._autopilot_sub.setsockopt(zmq.CONFLATE, 1)
+        self._autopilot_sub.connect(f"tcp://{autopilot_host}:{autopilot_port}")
+        self._autopilot_sub.setsockopt(zmq.SUBSCRIBE, b"autopilot_cmd")
+        # _latest_autopilot is refreshed each frame from the CONFLATE'd SUB.
+        # _autopilot_was_active tracks rising/falling edges for snapshot/recalibrate.
+        self._latest_autopilot = None  # dict {active, kind, movement, facing, speed, mode}
+        self._autopilot_was_active = False
+        self._autopilot_snapshot = None  # dict {vr_position, vr_orientation, lh, rh}
+        self._deadman_threshold = float(deadman_threshold)
+
+        # ---- Walk-straight override (set by manager during record toggles) ----
+        # None / "forward" / "backward". When set, run_once() overrides the
+        # joystick read so the operator can walk perfectly straight (bypasses
+        # Quest stick angular bias) — paired with the record toggle so a single
+        # button starts both walking + recording.
+        self._walk_straight_mode = None  # type: ignore[assignment]
+
+        # ---- Init pose: fixed upper-body+hands target used by record+walk and
+        # by replay. Loaded once from disk if present. yaw is NOT stored here;
+        # the lock value is taken from yaw_accumulator at the moment override
+        # engages (see _override_was_active below).
+        self._init_pose = self._load_init_pose()
+        self._override_was_active = False
+        self._yaw_lock = None  # list[float] of length 3, set at override-rising edge
+
+    INIT_POSE_PATH = (
+        Path(__file__).resolve().parent.parent
+        / "data"
+        / "autopilot_trajs"
+        / "init_pose.json"
+    )
+
+    @classmethod
+    def _load_init_pose(cls):
+        """Load the fixed upper-body+hands init pose from JSON if present.
+
+        Returns a dict shaped like _autopilot_snapshot {vr_position,
+        vr_orientation, lh, rh} or None when the file is missing (in which
+        case overrides fall back to capture-current-pose).
+        """
+        path = cls.INIT_POSE_PATH
+        if not path.exists():
+            print(f"[PlannerLoop] init_pose.json not found at {path} — overrides will capture-current-pose instead")
+            return None
+        try:
+            import json as _json
+            with open(path, "r", encoding="utf-8") as fh:
+                data = _json.load(fh)
+            snap = {
+                "vr_position": list(data["vr_3pt_position"]),
+                "vr_orientation": list(data["vr_3pt_orientation"]),
+                "lh": list(data["lh_joints"]),
+                "rh": list(data["rh_joints"]),
+            }
+            print(f"[PlannerLoop] loaded init_pose from {path}")
+            return snap
+        except Exception as e:
+            print(f"[PlannerLoop] failed to load {path}: {e} — overrides will capture-current-pose")
+            return None
+
+    def reload_init_pose(self):
+        """Hot-reload init_pose.json after a capture; called from manager loop."""
+        self._init_pose = self._load_init_pose()
 
     def reset_yaw(self):
         """Called when entering planner mode. Resets state for fresh start."""
@@ -1686,6 +1793,97 @@ class PlannerStreamer:
     def save_upper_body_position_target(self):
         """Poll feedback and save upper body position target."""
         self.feedback_reader.poll_feedback()
+
+    def _poll_autopilot(self) -> None:
+        """Drain latest autopilot_cmd into self._autopilot_cmd / _autopilot_active.
+
+        CONFLATE keeps only the freshest message; we re-read each frame so a
+        stale "active" state never lingers when auto_pilot.py exits.
+        """
+        try:
+            raw = self._autopilot_sub.recv(zmq.NOBLOCK)
+        except zmq.Again:
+            return
+        try:
+            data = unpack_pose_message_inline(raw, topic="autopilot_cmd")
+        except Exception:
+            return
+        active = bool(data["active"].flat[0]) if "active" in data else False
+        kind = int(data["kind"].flat[0]) if "kind" in data else 0
+        movement = (
+            data["movement"].flatten().astype(np.float32)
+            if "movement" in data and data["movement"].size == 3
+            else np.zeros(3, dtype=np.float32)
+        )
+        facing = (
+            data["facing"].flatten().astype(np.float32)
+            if "facing" in data and data["facing"].size == 3
+            else np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        )
+        speed_v = float(data["speed"].flat[0]) if "speed" in data else -1.0
+        mode_v = int(data["mode"].flat[0]) if "mode" in data else int(LocomotionMode.IDLE)
+        self._latest_autopilot = {
+            "active": active,
+            "kind": kind,
+            "movement": movement,
+            "facing": facing,
+            "speed": speed_v,
+            "mode": mode_v,
+        }
+
+    def _build_current_snapshot(self, stream_mode: "StreamMode") -> dict:
+        """Return the {vr_position, vr_orientation, lh, rh} dict from the
+        operator's current VR pose + controller hand inputs. Used by both the
+        autopilot snapshot capture (replay engage) and the init-pose capture
+        button (right_menu_button)."""
+        snap = {"vr_position": None, "vr_orientation": None, "lh": None, "rh": None}
+        if stream_mode == StreamMode.PLANNER_VR_3PT:
+            sample = self.reader.get_latest()
+            if sample is not None:
+                vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
+                snap["vr_position"] = vr_3pt_pose[:, :3].flatten().tolist()
+                snap["vr_orientation"] = vr_3pt_pose[:, 3:].flatten().tolist()
+            (
+                _,
+                left_trigger,
+                right_trigger,
+                left_grip,
+                right_grip,
+            ) = get_controller_inputs()
+            lh, rh = compute_hand_joints_from_inputs(
+                self.left_hand_ik_solver,
+                self.right_hand_ik_solver,
+                left_trigger,
+                left_grip,
+                right_trigger,
+                right_grip,
+            )
+            snap["lh"] = lh.reshape(-1).astype(np.float32).tolist()
+            snap["rh"] = rh.reshape(-1).astype(np.float32).tolist()
+        return snap
+
+    def _capture_autopilot_snapshot(self, stream_mode: "StreamMode") -> None:
+        """Freeze upper-body command sources at the moment autopilot engages.
+
+        After capture, until disengage we re-issue these same vr_3pt and hand
+        targets — so the operator can drop their arms and the robot's upper
+        body holds still.
+        """
+        self._autopilot_snapshot = self._build_current_snapshot(stream_mode)
+        print("[PlannerLoop] Autopilot ENGAGED — upper body snapshot captured")
+
+
+    def _publish_autopilot_cancel(self) -> None:
+        """Tell auto_pilot.py to disengage (deadman or local override)."""
+        try:
+            self.socket.send(
+                pack_pose_message(
+                    {"action": np.array([3], dtype=np.int32)},
+                    topic="autopilot_request",
+                )
+            )
+        except Exception as e:
+            print(f"[PlannerLoop] failed to publish autopilot cancel: {e}")
 
     def recalibrate_for_vr3pt(self):
         """
@@ -1732,17 +1930,76 @@ class PlannerStreamer:
             # Read axes/joysticks to control movement, facing, speed and mode
             lx, ly, rx, ry = get_controller_axes()
 
-            # Press LEFT stick = walk straight forward at max stick magnitude.
-            # Bypasses physical-stick angular bias on Quest. Only enabled when
-            # the outer loop is in --force-vr-3pt mode (otherwise left_axis_click
-            # is reserved for PLANNER <-> VR_3PT toggling in the Manager loop).
-            if self.stick_click_forward:
-                left_click, _ = get_axis_clicks()
-                if left_click:
-                    lx, ly = 0.0, 1.0
+            # Walk-straight override: pinned by manager while a record toggle
+            # is active. Forces lx/ly to a clean straight-line vector so the
+            # operator can run record_forward / record_return without fighting
+            # Quest stick angular bias. Yaw control via rx is untouched.
+            if self._walk_straight_mode == "forward":
+                lx, ly = 0.0, 1.0
+            elif self._walk_straight_mode == "backward":
+                lx, ly = 0.0, -1.0
 
-            # Facing from RIGHT stick: continuous yaw based on rx (right = turn right, left = turn left)
+            # ---- Autopilot multiplex ----
+            # Drain latest autopilot_cmd, decide whether to engage this frame,
+            # and detect rising/falling edges to (de)freeze the upper body.
+            self._poll_autopilot()
+            raw_mag_pre = float(np.clip(np.hypot(lx, ly), 0.0, 1.0))
+            wants_active = bool(
+                self._latest_autopilot is not None and self._latest_autopilot.get("active", False)
+            )
+            deadman = raw_mag_pre > self._deadman_threshold
+            if wants_active and deadman and self._autopilot_was_active:
+                print(
+                    f"[PlannerLoop] Autopilot DEADMAN (|stick|={raw_mag_pre:.2f}) → publish cancel"
+                )
+                self._publish_autopilot_cancel()
+            autopilot_engaged = wants_active and not deadman
+
+            if autopilot_engaged and not self._autopilot_was_active:
+                self._capture_autopilot_snapshot(stream_mode)
+            elif (not autopilot_engaged) and self._autopilot_was_active:
+                # Operator is taking over: re-zero VR tracking to their current pose.
+                if stream_mode == StreamMode.PLANNER_VR_3PT:
+                    self.recalibrate_for_vr3pt()
+                self._autopilot_snapshot = None
+                print("[PlannerLoop] Autopilot DISENGAGED — recalibrated VR 3PT")
+            self._autopilot_was_active = autopilot_engaged
+
+            # Unified override: either autopilot replay OR a record+walk toggle
+            # pins the upper body to a fixed init pose and locks yaw. The two
+            # paths share _autopilot_snapshot + _yaw_lock so the planner-side
+            # consumer code is the same regardless of which side triggered it.
+            override_active = autopilot_engaged or (self._walk_straight_mode is not None)
+            if override_active and not self._override_was_active:
+                # Rising edge — install init pose (or capture current as fallback)
+                # and snapshot yaw so we freeze the heading at this instant.
+                # Hot-reload init_pose.json so the most recent Backspace dump
+                # is picked up without restarting the manager.
+                self._init_pose = self._load_init_pose()
+                if self._init_pose is not None:
+                    self._autopilot_snapshot = dict(self._init_pose)
+                    print("[PlannerLoop] Override ENGAGED — using init_pose")
+                elif not autopilot_engaged:
+                    # Autopilot path already captured via _capture_autopilot_snapshot
+                    # above; only do the fallback capture for the walk_straight path.
+                    self._capture_autopilot_snapshot(stream_mode)
+                    print("[PlannerLoop] Override ENGAGED — captured current pose (no init_pose.json)")
+                self._yaw_lock = list(self.yaw_accumulator.heading)
+            elif (not override_active) and self._override_was_active:
+                self._yaw_lock = None
+                print("[PlannerLoop] Override DISENGAGED — yaw unlocked")
+            self._override_was_active = override_active
+
+            # Facing from RIGHT stick: continuous yaw based on rx (right = turn right, left = turn left).
+            # During autopilot we replace the heading from the trajectory below.
             facing = self.yaw_accumulator.update(rx, self.dt)
+
+            # Yaw lock: while override is active, ignore rx updates and pin to
+            # the heading captured at the rising edge.
+            if override_active and self._yaw_lock is not None:
+                facing = list(self._yaw_lock)
+                self.yaw_accumulator.heading = list(facing)
+                self.yaw_accumulator.yaw_angle_rad = float(np.arctan2(facing[1], facing[0]))
 
             raw_mag = np.hypot(lx, ly)
             raw_mag = np.clip(raw_mag, 0.0, 1.0)
@@ -1774,6 +2031,16 @@ class PlannerStreamer:
 
             movement = [movement_global[0], movement_global[1], 0.0]
 
+            if autopilot_engaged and self._latest_autopilot is not None:
+                ap = self._latest_autopilot
+                movement = [float(ap["movement"][0]), float(ap["movement"][1]), float(ap["movement"][2])]
+                facing = [float(ap["facing"][0]), float(ap["facing"][1]), float(ap["facing"][2])]
+                # Keep yaw_accumulator in sync so handover is smooth.
+                self.yaw_accumulator.heading = list(facing)
+                self.yaw_accumulator.yaw_angle_rad = float(np.arctan2(facing[1], facing[0]))
+                speed = float(ap["speed"])
+                mode_to_send = LocomotionMode(int(ap["mode"]))
+
             upper_body_position = None
             left_hand_position = None
             right_hand_position = None
@@ -1786,32 +2053,48 @@ class PlannerStreamer:
             vr_3pt_orientation = None
             vr_3pt_compliance = None
             if stream_mode == StreamMode.PLANNER_VR_3PT:
-                sample = self.reader.get_latest()
-                if sample is not None:
-                    print("[PlannerLoop] Sending VR 3-point pose as target")
-                    vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
-                    vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
-                    vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
+                if override_active and self._autopilot_snapshot is not None:
+                    # Hold the init / snapshotted pose so the operator can
+                    # drop arms / adjust HMD. Triggered by replay or by a
+                    # record+walk toggle (right_grip+A / right_grip+B).
+                    vr_3pt_position = self._autopilot_snapshot.get("vr_position")
+                    vr_3pt_orientation = self._autopilot_snapshot.get("vr_orientation")
+                    left_hand_position = self._autopilot_snapshot.get("lh")
+                    right_hand_position = self._autopilot_snapshot.get("rh")
+                else:
+                    sample = self.reader.get_latest()
+                    if sample is not None:
+                        # Throttle: this used to print every loop iteration (20Hz)
+                        # which buried other logs. Now print at most once every 5s.
+                        now_t = time.monotonic()
+                        if not hasattr(self, "_last_vr3pt_print_t") or (
+                            now_t - self._last_vr3pt_print_t > 5.0
+                        ):
+                            print("[PlannerLoop] Sending VR 3-point pose as target (throttled, 5s)")
+                            self._last_vr3pt_print_t = now_t
+                        vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
+                        vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
+                        vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
 
-                # Compute hand joints from trigger/grip inputs so operator can
-                # control hand open/close while in VR 3PT mode
-                (
-                    left_menu_button,
-                    left_trigger,
-                    right_trigger,
-                    left_grip,
-                    right_grip,
-                ) = get_controller_inputs()
-                lh_joints, rh_joints = compute_hand_joints_from_inputs(
-                    self.left_hand_ik_solver,
-                    self.right_hand_ik_solver,
-                    left_trigger,
-                    left_grip,
-                    right_trigger,
-                    right_grip,
-                )
-                left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
-                right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
+                    # Compute hand joints from trigger/grip inputs so operator can
+                    # control hand open/close while in VR 3PT mode
+                    (
+                        left_menu_button,
+                        left_trigger,
+                        right_trigger,
+                        left_grip,
+                        right_grip,
+                    ) = get_controller_inputs()
+                    lh_joints, rh_joints = compute_hand_joints_from_inputs(
+                        self.left_hand_ik_solver,
+                        self.right_hand_ik_solver,
+                        left_trigger,
+                        left_grip,
+                        right_trigger,
+                        right_grip,
+                    )
+                    left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
+                    right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
 
             msg = build_planner_message(
                 mode_to_send.value,
@@ -1921,7 +2204,6 @@ def run_pico_manager(
         poll_hz=20,
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
-        stick_click_forward=force_vr_3pt,
     )
 
     # State machine diagram:
@@ -1951,13 +2233,106 @@ def run_pico_manager(
         prev_by_pressed = False
         prev_start_combo = False
         prev_left_axis_click = False
+        prev_right_axis_click = False
+        prev_a_pressed = False
+        prev_b_pressed = False
+        # Walk-straight + record toggle state. Mirrored onto the planner
+        # streamer each frame so its override stays in sync.
+        walk_straight_mode = None  # None | "forward" | "backward"
         while True:
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
 
-            left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs()
+            left_menu_button, _, _, left_grip_mgr, right_grip_mgr = get_controller_inputs()
 
-            left_axis_click, _ = get_axis_clicks()
+            left_axis_click, right_axis_click = get_axis_clicks()
+
+            # init_pose.json is now written by the sim itself when the operator
+            # taps Backspace in the MJ viewer (see BaseSim._dump_init_pose_after_reset).
+            # No manager-side capture button anymore.
+
+            # Autopilot stick-click edges: only meaningful when --force-vr-3pt is
+            # set (otherwise left_axis_click is the PLANNER<->VR_3PT toggle).
+            # Left click rising  -> forward toggle; Right click rising -> return toggle.
+            if force_vr_3pt and current_mode == StreamMode.PLANNER_VR_3PT:
+                action = 0  # ACTION_NONE
+                if left_axis_click and not prev_left_axis_click:
+                    action = 1  # ACTION_FORWARD_TOGGLE
+                elif right_axis_click and not prev_right_axis_click:
+                    action = 2  # ACTION_RETURN_TOGGLE
+                if action != 0:
+                    socket.send(
+                        pack_pose_message(
+                            {"action": np.array([action], dtype=np.int32)},
+                            topic="autopilot_request",
+                        )
+                    )
+                    print(
+                        f"[Manager] autopilot_request action={action} "
+                        f"(1=forward,2=return,3=cancel)"
+                    )
+
+            # Autopilot record toggles. Right-grip-gated so they can't collide
+            # with A+X / B+Y / A+B+X+Y combos (those don't require any grip)
+            # and with A+left_grip / B+left_grip (data collection toggles).
+            #   right_grip + A  (alone) -> record forward toggle
+            #   right_grip + B  (alone) -> record return toggle
+            # Gated to PLANNER_VR_3PT so we don't accidentally start a recording
+            # outside of a driveable mode.
+            a_rising = a_pressed and not prev_a_pressed
+            b_rising = b_pressed and not prev_b_pressed
+            if a_rising or b_rising:
+                # Diagnostic: always log the gate values on every A/B rising
+                # edge, so when the operator wonders "why didn't record fire"
+                # they can scrollback and see exactly which gate condition failed.
+                print(
+                    f"[Manager] A/B edge: a={a_pressed} b={b_pressed} x={x_pressed} y={y_pressed} "
+                    f"r_grip={right_grip_mgr:.2f} l_grip={left_grip_mgr:.2f} mode={current_mode.name}"
+                )
+            if (
+                current_mode == StreamMode.PLANNER_VR_3PT
+                and right_grip_mgr > 0.5
+                and left_grip_mgr < 0.3
+                and not x_pressed
+                and not y_pressed
+            ):
+                # Toggle: each press flips between None and the matching
+                # walk-straight mode. Interlocked — pressing A while a return
+                # record is active (or B while forward is active) is ignored.
+                rec_action = 0
+                new_walk = walk_straight_mode  # default: unchanged
+                if a_rising and not b_pressed:
+                    if walk_straight_mode == "forward":
+                        new_walk = None  # stop record_forward + walk
+                        rec_action = 1
+                    elif walk_straight_mode is None:
+                        new_walk = "forward"  # start record_forward + walk
+                        rec_action = 1
+                    # else: walk_straight_mode == "backward" → ignore
+                elif b_rising and not a_pressed:
+                    if walk_straight_mode == "backward":
+                        new_walk = None
+                        rec_action = 2
+                    elif walk_straight_mode is None:
+                        new_walk = "backward"
+                        rec_action = 2
+                    # else: walk_straight_mode == "forward" → ignore
+                if rec_action != 0:
+                    walk_straight_mode = new_walk
+                    planner_streamer._walk_straight_mode = walk_straight_mode
+                    socket.send(
+                        pack_pose_message(
+                            {"action": np.array([rec_action], dtype=np.int32)},
+                            topic="record_request",
+                        )
+                    )
+                    kind = "forward" if rec_action == 1 else "return"
+                    action_word = "START" if walk_straight_mode is not None else "STOP"
+                    bar = "=" * 60
+                    print(
+                        f"\n{bar}\n[Manager] >>> {action_word} record_{kind} "
+                        f"(walk_straight={walk_straight_mode}) <<<\n{bar}"
+                    )
 
             # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
             ax_pressed = (a_pressed) and (x_pressed)
@@ -2040,6 +2415,29 @@ def run_pico_manager(
                 if current_mode == StreamMode.POSE:
                     pose_streamer.on_mode_exit()
 
+                # Leaving PLANNER_VR_3PT clears any active walk-straight record
+                # so we never strand the operator with a phantom override.
+                if (
+                    current_mode == StreamMode.PLANNER_VR_3PT
+                    and new_mode != StreamMode.PLANNER_VR_3PT
+                    and walk_straight_mode is not None
+                ):
+                    print(
+                        f"[Manager] mode switch out of VR_3PT — clearing walk_straight "
+                        f"(was {walk_straight_mode!r}; record will get a stop toggle)"
+                    )
+                    # Send the matching stop toggle so the daemon flushes its
+                    # buffer to JSON; otherwise the recording is lost.
+                    stop_action = 1 if walk_straight_mode == "forward" else 2
+                    socket.send(
+                        pack_pose_message(
+                            {"action": np.array([stop_action], dtype=np.int32)},
+                            topic="record_request",
+                        )
+                    )
+                    walk_straight_mode = None
+                    planner_streamer._walk_straight_mode = None
+
                 # Track parent when entering VR_3PT
                 if new_mode == StreamMode.PLANNER_VR_3PT:
                     vr3pt_parent_mode = current_mode
@@ -2113,6 +2511,9 @@ def run_pico_manager(
             prev_by_pressed = by_pressed
             prev_start_combo = start_combo
             prev_left_axis_click = left_axis_click
+            prev_right_axis_click = right_axis_click
+            prev_a_pressed = a_pressed
+            prev_b_pressed = b_pressed
 
     except KeyboardInterrupt:
         print("\nStopping manager...")

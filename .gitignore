@@ -210,6 +210,12 @@ teleop_vids/
 *.code-workspace
 # Motion/training data (large local datasets, not tracked in git)
 data/
+# ...but keep the small autopilot trajectory JSONs versioned (not the trace log)
+!gear_sonic/data/
+gear_sonic/data/*
+!gear_sonic/data/autopilot_trajs/
+gear_sonic/data/autopilot_trajs/*
+!gear_sonic/data/autopilot_trajs/*.json
 bones_seed_smpl/
 sonic_release/
 # Training output logs

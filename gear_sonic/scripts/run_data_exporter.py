@@ -50,6 +50,51 @@ from gear_sonic.utils.data_collection.zmq_state_subscriber import (
 )
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_CN_DIGITS = "零一二三四五六七八九"
+_CN_UNITS = ["", "十", "百", "千"]
+
+
+def int_to_chinese(num: int) -> str:
+    """Read a non-negative integer as Chinese numerals (19 -> 十九).
+
+    The G1 speaker garbles raw digits embedded in Chinese, so episode
+    numbers are converted to words before being spoken. Covers the counts
+    we ever reach (well under 10000) and degrades gracefully above.
+    """
+    if num < 0:
+        return "负" + int_to_chinese(-num)
+    if num == 0:
+        return "零"
+    if num >= 10000:
+        high, low = divmod(num, 10000)
+        low_str = int_to_chinese(low) if low else ""
+        if low and low < 1000:
+            low_str = "零" + low_str
+        return int_to_chinese(high) + "万" + low_str
+
+    result = ""
+    need_zero = False
+    unit_pos = 0
+    while num > 0:
+        digit = num % 10
+        if digit == 0:
+            need_zero = result != ""
+        else:
+            prefix = "零" if need_zero else ""
+            result = _CN_DIGITS[digit] + _CN_UNITS[unit_pos] + prefix + result
+            need_zero = False
+        num //= 10
+        unit_pos += 1
+    # Chinese drops the leading "一" in 10..19 (10 -> 十, not 一十).
+    if result.startswith("一十"):
+        result = result[1:]
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
@@ -329,7 +374,8 @@ class GrootDataCollector:
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self._initial_yaw = None
                 self._print_and_say(
-                    f"开始录制第 {self.current_episode_index} 条", blocking=False
+                    f"开始录制第{int_to_chinese(self.current_episode_index)}条",
+                    blocking=False,
                 )
             elif self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
                 self._print_and_say("停止录制，正在保存", blocking=False)

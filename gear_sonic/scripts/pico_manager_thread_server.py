@@ -2084,9 +2084,13 @@ class PlannerStreamer:
             # During autopilot we replace the heading from the trajectory below.
             facing = self.yaw_accumulator.update(rx, self.dt)
 
-            # Yaw lock: while override is active, ignore rx updates and pin to
-            # the heading captured at the rising edge.
-            if override_active and self._yaw_lock is not None:
+            # Yaw lock: only while we're RECORDING a clean straight walk
+            # (_walk_straight_mode) do we pin the heading and ignore rx — so
+            # the recording stays drift-free. During autopilot REPLAY we let
+            # rx drive yaw so the operator can correct open-loop drift on the
+            # fly (P1 fix). The captured _yaw_lock is still set on the rising
+            # edge but only consumed in the walk-straight path.
+            if (self._walk_straight_mode is not None) and self._yaw_lock is not None:
                 facing = list(self._yaw_lock)
                 self.yaw_accumulator.heading = list(facing)
                 self.yaw_accumulator.yaw_angle_rad = float(np.arctan2(facing[1], facing[0]))
@@ -2138,11 +2142,21 @@ class PlannerStreamer:
 
             if autopilot_engaged and self._latest_autopilot is not None:
                 ap = self._latest_autopilot
-                movement = [float(ap["movement"][0]), float(ap["movement"][1]), float(ap["movement"][2])]
-                facing = [float(ap["facing"][0]), float(ap["facing"][1]), float(ap["facing"][2])]
-                # Keep yaw_accumulator in sync so handover is smooth.
-                self.yaw_accumulator.heading = list(facing)
-                self.yaw_accumulator.yaw_angle_rad = float(np.arctan2(facing[1], facing[0]))
+                # Re-project the recorded global movement onto current facing
+                # (driven live by the right stick) so right-stick yaw
+                # corrections actually steer the robot, instead of leaving it
+                # crab-walking toward the recording's original world heading.
+                rec_facing = np.array(ap["facing"][:2], dtype=np.float32)
+                rec_move = np.array(ap["movement"][:2], dtype=np.float32)
+                fwd_mag = float(np.dot(rec_move, rec_facing))
+                movement = [
+                    float(facing[0]) * fwd_mag,
+                    float(facing[1]) * fwd_mag,
+                    float(ap["movement"][2]),
+                ]
+                # facing intentionally NOT overridden — yaw_accumulator (rx)
+                # drives it, both for live correction and so handover back to
+                # manual is automatically smooth.
                 speed = float(ap["speed"])
                 mode_to_send = LocomotionMode(int(ap["mode"]))
 

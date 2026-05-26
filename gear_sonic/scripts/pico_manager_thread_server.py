@@ -523,7 +523,7 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
 
 
 # Joystick deadzone threshold
-JOYSTICK_DEADZONE = 0.15
+JOYSTICK_DEADZONE = 0.03
 
 
 _ZMQ_HEADER_SIZE = 1280

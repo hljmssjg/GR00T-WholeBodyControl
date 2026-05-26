@@ -1,0 +1,47 @@
+ssh unitree@192.168.123.164
+cd ~/GR00T-WholeBodyControl
+source .venv_camera/bin/activate
+python3 -m gear_sonic.camera.composed_camera \
+    --ego-view-camera usb \
+    --ego-view-device-id 0 \
+    --port 5555
+
+
+
+python3 gear_sonic/scripts/launch_data_collection.py \
+  --autopilot \
+  --task-prompt 'xxxx' \
+  --sim
+
+cd /home/jg/baseline/GR00T-WholeBodyControl
+python3 gear_sonic/scripts/launch_data_collection.py \
+  --autopilot \
+  --task-prompt 'Put the teddy bear in the bag.' \
+  --camera-host 192.168.123.164 \
+  --tts-backend g1 
+
+
+cd /home/jg/baseline/GR00T-WholeBodyControl
+python3 gear_sonic/scripts/run_episode_browser.py \
+  --dataset outputs/2026-05-26-merged \
+  --port 8765
+
+
+.venv_data_collection/bin/python gear_sonic/scripts/process_dataset.py \
+  --dataset-path outputs/2026-05-26-merged \
+  --output-path outputs/2026-05-26-final \
+  --no-remove-stale-smpl
+
+
+.venv_data_collection/bin/hf upload Jiangeng/G1_05_26 \
+  outputs/2026-05-26-final . \
+  --repo-type dataset
+
+
+python3 gear_sonic/scripts/launch_inference.py \
+    --policy-host localhost --policy-port 5550 \
+    --camera-host 192.168.123.164 \
+    --prompt "Put the teddy bear in the bag."
+
+
+kip pk

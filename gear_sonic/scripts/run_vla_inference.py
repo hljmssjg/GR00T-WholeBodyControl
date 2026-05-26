@@ -409,6 +409,7 @@ def main(config: InferenceConfig):
 
     def publish_initial_pose():
         """Publish initial pose command to move robot to starting position."""
+        nonlocal init_blend_left_hand, init_blend_right_hand
         print("Moving to initial pose")
         left_hand = (
             _compute_closed_hand_joints("L")
@@ -420,6 +421,8 @@ def main(config: InferenceConfig):
             if initial_pose_right_hand_closed
             else np.zeros(7, dtype=np.float32)
         )
+        init_blend_left_hand = left_hand.astype(np.float32).copy()
+        init_blend_right_hand = right_hand.astype(np.float32).copy()
         zmq_message = pack_latent_action_message(
             motion_token=LATENT_INITIAL_MOTION_TOKEN,
             frame_index=np.array([0], dtype=np.int64),
@@ -460,6 +463,20 @@ def main(config: InferenceConfig):
 
     zmq_frame_counter = 0
 
+    # Safety ramp from init pose to first policy action on resume (key 'p').
+    # Without this, the very first published motion_token can differ a lot from
+    # LATENT_INITIAL_MOTION_TOKEN, which the C++ deploy tracks at full PD gain
+    # and the robot violently jerks ("爆起").
+    RESUME_BLEND_DURATION_S = 0.5
+    resume_blend_steps_total = max(
+        1, int(round(RESUME_BLEND_DURATION_S * config.action_publish_rate))
+    )
+    resume_blend_steps_remaining = 0
+    first_chunk_after_resume = False
+    init_blend_motion_token = LATENT_INITIAL_MOTION_TOKEN.astype(np.float32).copy()
+    init_blend_left_hand = np.zeros(7, dtype=np.float32)
+    init_blend_right_hand = np.zeros(7, dtype=np.float32)
+
     PROMPT_MSG_PREFIX = "prompt:"
 
     def check_keyboard_input():
@@ -467,6 +484,7 @@ def main(config: InferenceConfig):
         nonlocal initial_pose_left_hand_closed, initial_pose_right_hand_closed
         nonlocal cached_action_chunk, action_chunk_index, last_inference_time
         nonlocal zmq_frame_counter
+        nonlocal resume_blend_steps_remaining, first_chunk_after_resume
 
         key = keyboard_listener.read_msg()
         if key is None:
@@ -509,7 +527,26 @@ def main(config: InferenceConfig):
             if pause_loop:
                 print("Policy loop paused (C++ loop still running - press 'k' to stop)")
             else:
-                print("Policy loop resumed")
+                # On resume: drop any stale chunk/result computed while paused,
+                # arm the ramp so the first ~0.5s of policy actions blend out
+                # from the init pose, and tell the consumer not to apply
+                # latency-compensated indexing to the first fresh chunk (the
+                # robot hasn't been executing the chunk's earlier steps).
+                cached_action_chunk = None
+                action_chunk_index = 0
+                last_inference_time = 0.0
+                try:
+                    while True:
+                        result_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                resume_blend_steps_remaining = resume_blend_steps_total
+                first_chunk_after_resume = True
+                print_green(
+                    f"Policy loop resumed (init->policy blend armed: "
+                    f"{resume_blend_steps_total} steps @ "
+                    f"{config.action_publish_rate} Hz)"
+                )
         elif key == "k":
             if cpp_loop_running:
                 current_planner = cpp_mode == "PLANNER"
@@ -573,13 +610,33 @@ def main(config: InferenceConfig):
             t_start = time.monotonic()
             check_keyboard_input()
 
+            # Don't run / consume inference while paused — a chunk computed
+            # against an old observation would be sent immediately on resume.
+            if pause_loop:
+                print("Pausing...", end="", flush=True)
+                time.sleep(0.2)
+                print(".", end="", flush=True)
+                continue
+
             # Consume result first so last_inference_time is fresh before trigger check
             try:
                 processed_action, inference_start_time = result_queue.get_nowait()
-                inference_delay = time.monotonic() - inference_start_time
-                action_chunk_index = calculate_latency_compensated_index(
-                    inference_delay, config.action_publish_rate, config.action_horizon
-                )
+                if first_chunk_after_resume:
+                    # Robot was holding init pose, not executing this chunk's
+                    # earlier steps — start from index 0 instead of skipping
+                    # ahead by the latency-compensated amount.
+                    action_chunk_index = 0
+                    first_chunk_after_resume = False
+                    inference_delay = time.monotonic() - inference_start_time
+                    print_green(
+                        f'First chunk after resume (latency: {inference_delay:.3f}s, '
+                        "starting from index 0)"
+                    )
+                else:
+                    inference_delay = time.monotonic() - inference_start_time
+                    action_chunk_index = calculate_latency_compensated_index(
+                        inference_delay, config.action_publish_rate, config.action_horizon
+                    )
                 cached_action_chunk = processed_action
                 last_inference_time = time.monotonic()
                 print_green(
@@ -602,12 +659,6 @@ def main(config: InferenceConfig):
                     inference_queue.put_nowait(None)
                 except queue.Full:
                     pass
-
-            if pause_loop:
-                print("Pausing...", end="", flush=True)
-                time.sleep(0.2)
-                print(".", end="", flush=True)
-                continue
 
             with telemetry.timer("total_loop"):
                 if cached_action_chunk is None:
@@ -651,6 +702,25 @@ def main(config: InferenceConfig):
                         left_hand_joints = left_hand_joints[current_idx]
                     if right_hand_joints.ndim == 2:
                         right_hand_joints = right_hand_joints[current_idx]
+
+                    # Linear blend from init pose to policy output over the
+                    # first resume_blend_steps_total publishes after 'p'.
+                    if resume_blend_steps_remaining > 0:
+                        step = resume_blend_steps_total - resume_blend_steps_remaining
+                        denom = max(1, resume_blend_steps_total - 1)
+                        alpha = float(step) / float(denom)
+                        motion_token = (
+                            (1.0 - alpha) * init_blend_motion_token + alpha * motion_token
+                        ).astype(np.float32)
+                        left_hand_joints = (
+                            (1.0 - alpha) * init_blend_left_hand + alpha * left_hand_joints
+                        ).astype(np.float32)
+                        right_hand_joints = (
+                            (1.0 - alpha) * init_blend_right_hand + alpha * right_hand_joints
+                        ).astype(np.float32)
+                        resume_blend_steps_remaining -= 1
+                        if resume_blend_steps_remaining == 0:
+                            print_green("Resume blend ramp complete -- full policy control")
 
                     frame_index = np.array([zmq_frame_counter], dtype=np.int64)
                     zmq_frame_counter += 1

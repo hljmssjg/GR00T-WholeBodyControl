@@ -452,28 +452,20 @@ def _play(
                     _disengage_play("missing clip")
                     continue
                 _, frames = clip
-                if kind == "forward":
-                    # Forward is a hold-one-frame command, not a timed
-                    # playback: walk_to_table.json's frames are all
-                    # identical (constant forward command), and the
-                    # operator decides when the robot has arrived by
-                    # toggling forward off. We republish frames[0] every
-                    # tick — right-stick yaw corrections in the manager
-                    # steer it without time pressure.
-                    pub.send(_build_autopilot_cmd(True, 1, frames[0]))
+                elapsed = time.monotonic() - play_start
+                while frame_idx + 1 < len(frames) and frames[frame_idx + 1].t <= elapsed:
+                    frame_idx += 1
+                if elapsed >= frames[-1].t:
+                    pub.send(_build_autopilot_cmd(True, 1 if kind == "forward" else 2, frames[-1]))
+                    finished_kind = kind
+                    _disengage_play(f"clip finished ({finished_kind})")
+                    pub.send(_build_autopilot_cmd(False, 0, None))
+                    if finished_kind == "return" and sim_reset:
+                        pub.send(_build_reset_cmd())
+                        print("[Autopilot] sent reset_cmd")
                 else:
-                    elapsed = time.monotonic() - play_start
-                    while frame_idx + 1 < len(frames) and frames[frame_idx + 1].t <= elapsed:
-                        frame_idx += 1
-                    if elapsed >= frames[-1].t:
-                        pub.send(_build_autopilot_cmd(True, 2, frames[-1]))
-                        _disengage_play("clip finished (return)")
-                        pub.send(_build_autopilot_cmd(False, 0, None))
-                        if sim_reset:
-                            pub.send(_build_reset_cmd())
-                            print("[Autopilot] sent reset_cmd")
-                    else:
-                        pub.send(_build_autopilot_cmd(True, 2, frames[frame_idx]))
+                    kind_code = 1 if kind == "forward" else 2
+                    pub.send(_build_autopilot_cmd(True, kind_code, frames[frame_idx]))
             else:
                 # idle or recording → publish idle heartbeat so the manager
                 # planner-side sees active=False and never tries to override.

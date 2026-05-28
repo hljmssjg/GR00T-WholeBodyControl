@@ -565,7 +565,7 @@ def unpack_pose_message_inline(packed: bytes, topic: str) -> dict:
 class YawAccumulator:
     """Accumulates yaw heading angle based on joystick input."""
 
-    def __init__(self, yaw_gain: float = 1.5, deadzone: float = JOYSTICK_DEADZONE):
+    def __init__(self, yaw_gain: float = 0.5, deadzone: float = JOYSTICK_DEADZONE):
         self.yaw_gain = yaw_gain
         self.deadzone = deadzone
         self.reset()

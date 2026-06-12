@@ -221,6 +221,11 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
             "shape": (num_joints,),
             "names": joint_names,
         },
+        "observation.velocity": {
+            "dtype": "float64",
+            "shape": (num_joints,),
+            "names": joint_names,
+        },
         "observation.eef_state": {
             "dtype": "float64",
             "shape": (14,),
@@ -245,6 +250,46 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
             "dtype": "float64",
             "shape": (3,),
             "names": ["gravity_x", "gravity_y", "gravity_z"],
+        },
+        "observation.base_angular_velocity": {
+            "dtype": "float64",
+            "shape": (3,),
+            "names": ["base_wx", "base_wy", "base_wz"],
+        },
+        "observation.base_acceleration": {
+            "dtype": "float64",
+            "shape": (3,),
+            "names": ["base_ax", "base_ay", "base_az"],
+        },
+        "observation.torso_orientation": {
+            "dtype": "float64",
+            "shape": (4,),
+            "names": ["torso_qw", "torso_qx", "torso_qy", "torso_qz"],
+        },
+        "observation.torso_angular_velocity": {
+            "dtype": "float64",
+            "shape": (3,),
+            "names": ["torso_wx", "torso_wy", "torso_wz"],
+        },
+        "observation.torso_acceleration": {
+            "dtype": "float64",
+            "shape": (3,),
+            "names": ["torso_ax", "torso_ay", "torso_az"],
+        },
+        "observation.motor_temperature": {
+            "dtype": "float64",
+            "shape": (58,),
+            "names": [f"motor_{i:02d}_{kind}" for i in range(29) for kind in ("winding", "driver")],
+        },
+        "observation.motor_error": {
+            "dtype": "float64",
+            "shape": (29,),
+            "names": [f"motor_{i:02d}_error" for i in range(29)],
+        },
+        "observation.motor_torque": {
+            "dtype": "float64",
+            "shape": (29,),
+            "names": [f"motor_{i:02d}_torque" for i in range(29)],
         },
         "observation.cpp_rotation_offset": {
             "dtype": "float64",
@@ -365,6 +410,61 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
                 "rwrist_r00", "rwrist_r10", "rwrist_r01", "rwrist_r11", "rwrist_r02", "rwrist_r12",
                 "neck_r00", "neck_r10", "neck_r01", "neck_r11", "neck_r02", "neck_r12",
             ],
+        },
+        "diagnostic.cpp_state_index": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["cpp_state_index"],
+        },
+        "diagnostic.cpp_state_index_delta": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["cpp_state_index_delta"],
+        },
+        "diagnostic.cpp_wall_timestamp_s": {
+            "dtype": "float64",
+            "shape": (1,),
+            "names": ["cpp_wall_timestamp_s"],
+        },
+        "diagnostic.camera_timestamp_s": {
+            "dtype": "float64",
+            "shape": (1,),
+            "names": ["camera_timestamp_s"],
+        },
+        "diagnostic.exporter_timestamp_s": {
+            "dtype": "float64",
+            "shape": (1,),
+            "names": ["exporter_timestamp_s"],
+        },
+        "diagnostic.state_age_ms": {
+            "dtype": "float64",
+            "shape": (1,),
+            "names": ["state_age_ms"],
+        },
+        "diagnostic.camera_age_ms": {
+            "dtype": "float64",
+            "shape": (1,),
+            "names": ["camera_age_ms"],
+        },
+        "diagnostic.image_state_delta_ms": {
+            "dtype": "float64",
+            "shape": (1,),
+            "names": ["image_state_delta_ms"],
+        },
+        "diagnostic.sonic_age_ms": {
+            "dtype": "float64",
+            "shape": (1,),
+            "names": ["sonic_age_ms"],
+        },
+        "diagnostic.encoder_mode": {
+            "dtype": "int32",
+            "shape": (1,),
+            "names": ["encoder_mode"],
+        },
+        "diagnostic.motion_play": {
+            "dtype": "int32",
+            "shape": (1,),
+            "names": ["motion_play"],
         },
     }
 

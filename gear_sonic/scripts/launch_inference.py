@@ -32,9 +32,12 @@ Usage (from repo root — no venv activation needed):
     python gear_sonic/scripts/launch_inference.py --no-data-exporter     # no recording pane
 """
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime
+import json
 from pathlib import Path
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -152,6 +155,9 @@ class InferenceLaunchConfig:
     dataset_name: str = ""
     """Dataset name for the data exporter. Leave empty to auto-generate."""
 
+    record_wrist_cameras: bool = False
+    """Record left and right wrist camera streams when available."""
+
 
 SESSION_NAME = "sonic_inference"
 
@@ -216,6 +222,19 @@ def _create_tmux_session():
         ["tmux", "bind-key", "-T", "root", "C-\\", "kill-session"],
     )
     subprocess.run(
+        ["tmux", "set-option", "-t", SESSION_NAME, "pane-border-status", "top"],
+    )
+    subprocess.run(
+        [
+            "tmux",
+            "set-option",
+            "-t",
+            SESSION_NAME,
+            "pane-border-format",
+            "#{?pane_active,#[bold,fg=cyan],#[fg=colour245]} #{pane_title} #[default]",
+        ],
+    )
+    subprocess.run(
         ["tmux", "rename-window", "-t", f"{SESSION_NAME}:0", "inference"],
     )
 
@@ -229,6 +248,23 @@ def _create_tmux_session():
     subprocess.run(
         ["tmux", "split-window", "-t", f"{SESSION_NAME}:0.2", "-v"],
     )
+    pane_titles = {
+        0: "C++ DEPLOY",
+        1: "KEYBOARD",
+        2: "VLA INFERENCE",
+        3: "DATA: STARTING",
+    }
+    for pane_index, title in pane_titles.items():
+        subprocess.run(
+            [
+                "tmux",
+                "select-pane",
+                "-t",
+                f"{SESSION_NAME}:0.{pane_index}",
+                "-T",
+                title,
+            ],
+        )
 
     time.sleep(5)
 
@@ -239,6 +275,61 @@ def _send_to_pane(pane_index: int, cmd: str, wait: float = 1.0):
         ["tmux", "send-keys", "-t", target, cmd, "C-m"],
     )
     time.sleep(wait)
+
+
+def _capture_pane_output(target: str, log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "tmux",
+            "pipe-pane",
+            "-o",
+            "-t",
+            target,
+            f"cat >> {shlex.quote(str(log_path))}",
+        ],
+        check=True,
+    )
+
+
+def _snapshot_run_context(
+    repo_root: Path,
+    output_dir: Path,
+    config: InferenceLaunchConfig,
+    run_name: str,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def git_output(*args: str) -> str:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout if result.returncode == 0 else result.stderr
+
+    manifest = {
+        "run_name": run_name,
+        "started_at": datetime.now().astimezone().isoformat(),
+        "argv": sys.argv,
+        "config": asdict(config),
+        "git_commit": git_output("rev-parse", "HEAD").strip(),
+        "hostname": socket.gethostname(),
+        "python": sys.version,
+    }
+    (output_dir / "run_manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    (output_dir / "git_status.txt").write_text(
+        git_output("status", "--short"),
+        encoding="utf-8",
+    )
+    (output_dir / "git_diff.patch").write_text(
+        git_output("diff", "--binary"),
+        encoding="utf-8",
+    )
 
 
 def _check_pane_alive(pane_index: int) -> bool:
@@ -258,6 +349,9 @@ def main(config: InferenceLaunchConfig):
     _kill_existing_session()
 
     exporter_prompt = config.task_prompt if config.task_prompt else config.prompt
+    run_name = config.dataset_name or datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    process_log_dir = repo_root / "outputs" / f"{run_name}-process-logs"
+    _snapshot_run_context(repo_root, process_log_dir, config, run_name)
 
     print("=" * 60)
     print("  SONIC VLA Inference Launcher")
@@ -273,6 +367,7 @@ def main(config: InferenceLaunchConfig):
     if config.data_exporter:
         print(f"    DC frequency:  {config.data_exporter_frequency} Hz")
         print(f"    Task prompt:   {exporter_prompt}")
+    print(f"  Run name:        {run_name}")
     print(f"  PC IP:           {_get_local_ip()}")
     print("=" * 60)
 
@@ -292,6 +387,7 @@ def main(config: InferenceLaunchConfig):
             f"--camera-port {config.camera_port}"
         )
         sim_target = f"{SESSION_NAME}:sim"
+        _capture_pane_output(sim_target, process_log_dir / "sim.log")
         subprocess.run(
             ["tmux", "send-keys", "-t", sim_target, sim_cmd, "C-m"],
         )
@@ -323,6 +419,10 @@ def main(config: InferenceLaunchConfig):
     deploy_cmd += deploy_mode
 
     print("Starting C++ deploy (pane 0)...")
+    _capture_pane_output(
+        f"{SESSION_NAME}:0.0",
+        process_log_dir / "cpp_deploy.log",
+    )
     _send_to_pane(0, deploy_cmd, wait=3.0)
 
     if not _check_pane_alive(0):
@@ -335,7 +435,8 @@ def main(config: InferenceLaunchConfig):
         pub = ctx.socket(zmq.PUB)
         pub.bind('tcp://localhost:5580')
         time.sleep(0.5)
-        print('Keyboard publisher ready. Keys: p=pause, k=start/stop, i=init pose, [/]=toggle hands, t=prompt')
+        print('Keyboard ready. Recording: c=start, s=save success, f=save failure, x=discard')
+        print('Control: p=pause, k=start/stop, i=init pose, [/]=toggle hands, t <text>=prompt')
         while True:
             key = input()
             if key.startswith('t '):
@@ -353,6 +454,10 @@ def main(config: InferenceLaunchConfig):
     )
 
     print("Starting keyboard publisher (pane 2)...")
+    _capture_pane_output(
+        f"{SESSION_NAME}:0.1",
+        process_log_dir / "keyboard_publisher.log",
+    )
     _send_to_pane(1, keyboard_cmd, wait=2.0)
 
     # --- Pane 3 (bottom-right): Data Exporter (optional) ---
@@ -361,15 +466,20 @@ def main(config: InferenceLaunchConfig):
             f"cd {repo_root} && "
             f"source .venv_data_collection/bin/activate && "
             f"python gear_sonic/scripts/run_data_exporter.py "
-            f"--task-prompt '{exporter_prompt}' "
+            f"--task-prompt {shlex.quote(exporter_prompt)} "
             f"--data-collection-frequency {config.data_exporter_frequency} "
             f"--camera-host {config.camera_host} "
-            f"--camera-port {config.camera_port}"
+            f"--camera-port {config.camera_port} "
+            f"--dataset-name {shlex.quote(run_name)}"
         )
-        if config.dataset_name:
-            exporter_cmd += f" --dataset-name '{config.dataset_name}'"
+        if config.record_wrist_cameras:
+            exporter_cmd += " --record-wrist-cameras"
 
         print("Starting data exporter (pane 3)...")
+        _capture_pane_output(
+            f"{SESSION_NAME}:0.3",
+            process_log_dir / "data_exporter.log",
+        )
         _send_to_pane(3, exporter_cmd, wait=2.0)
 
     # --- Pane 1 (top-right): VLA Inference ---
@@ -380,14 +490,19 @@ def main(config: InferenceLaunchConfig):
         f"--host {config.policy_host} "
         f"--port {config.policy_port} "
         f"--embodiment-tag {config.embodiment_tag} "
-        f"--prompt '{config.prompt}' "
+        f"--prompt {shlex.quote(config.prompt)} "
         f"--action-publish-rate {config.action_publish_rate} "
         f"--action-horizon {config.action_horizon} "
         f"--camera-host {config.camera_host} "
-        f"--camera-port {config.camera_port}"
+        f"--camera-port {config.camera_port} "
+        f"--diagnostic-log-dir {shlex.quote(str(process_log_dir / 'inference_trace'))}"
     )
 
     print("Starting VLA inference (pane 1)...")
+    _capture_pane_output(
+        f"{SESSION_NAME}:0.2",
+        process_log_dir / "vla_inference.log",
+    )
     _send_to_pane(2, inference_cmd, wait=1.0)
 
     # Select the VLA inference pane
@@ -423,9 +538,10 @@ def main(config: InferenceLaunchConfig):
     print("    ]        - Toggle right hand open/closed (initial pose)")
     print("    t <text> - Change inference prompt")
     if config.data_exporter:
-        print("    c        - Start recording episode")
+        print("    c        - Start recording episode (does not stop)")
         print("    s        - Stop recording (success)")
         print("    f        - Stop recording (failure)")
+    print(f"  Process logs: {process_log_dir}")
     print()
     print("  Navigation:")
     print("    Ctrl+b, arrow keys  - Switch between panes")

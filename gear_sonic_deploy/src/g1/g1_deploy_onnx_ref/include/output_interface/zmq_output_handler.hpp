@@ -21,7 +21,7 @@
  * ## `{user_topic}` (e.g. `g1_debug`) — published every tick
  * ---------------------------------------------------------------------------
  *
- * A single msgpack map with up to 30 keys (28 always-present + 2 conditional).
+ * A single msgpack map with up to 39 keys (37 always-present + 2 conditional).
  * All joints are in **MuJoCo order** (remapped from IsaacLab via
  * `isaaclab_to_mujoco`).
  *
@@ -31,16 +31,19 @@
  *   1  | control_loop_type      | string       | Always "cpp".
  *   2  | index                  | int          | Monotonic state-logger entry index.
  *   3  | ros_timestamp          | double       | ROS 2 wall-clock (s); 0.0 if no ROS 2.
+ *   4  | wall_timestamp         | double       | System wall-clock timestamp (Unix seconds).
  *      |                        |              |
  *      | **Base IMU**           |              |
  *   4  | base_quat              | double[4]    | Base IMU quaternion (w,x,y,z).
  *   5  | base_ang_vel           | double[3]    | Base angular velocity.
- *   6  | body_torso_quat        | double[4]    | Torso IMU quaternion.
- *   7  | body_torso_ang_vel     | double[3]    | Torso angular velocity.
+ *   6  | base_accel             | double[3]    | Base linear acceleration.
+ *   7  | body_torso_quat        | double[4]    | Torso IMU quaternion.
+ *   8  | body_torso_ang_vel     | double[3]    | Torso angular velocity.
+ *   9  | body_torso_accel       | double[3]    | Torso linear acceleration.
  *      |                        |              |
  *      | **Body joints**        |              |
- *   8  | body_q                 | double[29]   | Joint positions (+ default offsets).
- *   9  | body_dq                | double[29]   | Joint velocities.
+ *  10  | body_q                 | double[29]   | Joint positions (+ default offsets).
+ *  11  | body_dq                | double[29]   | Joint velocities.
  *      |                        |              |
  *      | **Hand joints**        |              |
  *  10  | left_hand_q            | double[7]    | Left-hand joint positions (from state logger).
@@ -54,7 +57,14 @@
  *  16  | last_right_hand_action | double[7]    | Last right-hand action.
  *      |                        |              |
  *      | **Encoder**            |              |
+ *      | **Motor diagnostics**  |              |
  *  17  | token_state            | double[N]    | Encoder token state (empty array if N/A).
+ *  18  | motor_temperature      | double[58]   | Winding/driver temperatures.
+ *  19  | motor_error            | double[29]   | Motor state/error codes.
+ *  20  | motor_torque           | double[29]   | Estimated motor torques.
+ *  21  | encoder_mode           | int          | Active encoder mode.
+ *  22  | motion_name            | string       | Current reference motion.
+ *  23  | play                   | bool         | Motion playback state.
  *      |                        |              |
  *      | **Heading** *(conditional — only when heading state is available)* |
  *  18  | init_base_quat         | double[4]    | Initial base quaternion at heading init.
@@ -279,9 +289,9 @@ private:
             has_heading_state = true;
         }
 
-        // State-logger fields: 18 base + 2 optional heading
+        // State-logger fields: 26 base + 2 optional heading
         // Visualisation fields: output_data_map_.size() (typically 11)
-        int num_state_fields = has_heading_state ? 20 : 18;
+        int num_state_fields = has_heading_state ? 28 : 26;
         int num_viz_fields = static_cast<int>(output_data_map_.size());
         pk.pack_map(num_state_fields + num_viz_fields);
 
@@ -296,6 +306,9 @@ private:
         pk.pack("ros_timestamp");
         pk.pack(state.ros_timestamp);
 
+        pk.pack("wall_timestamp");
+        pk.pack(std::chrono::duration<double>(state.timestamp.time_since_epoch()).count());
+
         pk.pack("base_quat");
         pk.pack_array(4);
         for (const auto& val : state.base_quat) pk.pack(val);
@@ -304,6 +317,10 @@ private:
         pk.pack_array(3);
         for (const auto& val : state.base_ang_vel) pk.pack(val);
 
+        pk.pack("base_accel");
+        pk.pack_array(3);
+        for (const auto& val : state.base_accel) pk.pack(val);
+
         pk.pack("body_torso_quat");
         pk.pack_array(4);
         for (const auto& val : state.body_torso_quat) pk.pack(val);
@@ -311,6 +328,10 @@ private:
         pk.pack("body_torso_ang_vel");
         pk.pack_array(3);
         for (const auto& val : state.body_torso_ang_vel) pk.pack(val);
+
+        pk.pack("body_torso_accel");
+        pk.pack_array(3);
+        for (const auto& val : state.body_torso_accel) pk.pack(val);
 
         // body_q: IsaacLab -> MuJoCo order, add default-angle offset
         pk.pack("body_q");
@@ -384,6 +405,23 @@ private:
         pk.pack("motor_temperature");
         pk.pack_array(state.motor_temperature.size());
         for (const auto& val : state.motor_temperature) pk.pack(val);
+
+        pk.pack("motor_error");
+        pk.pack_array(state.motor_error.size());
+        for (const auto& val : state.motor_error) pk.pack(val);
+
+        pk.pack("motor_torque");
+        pk.pack_array(state.motor_torque.size());
+        for (const auto& val : state.motor_torque) pk.pack(val);
+
+        pk.pack("encoder_mode");
+        pk.pack(state.encoder_mode);
+
+        pk.pack("motion_name");
+        pk.pack(state.motion_name);
+
+        pk.pack("play");
+        pk.pack(state.play);
 
         if (has_heading_state) {
             pk.pack("init_base_quat");

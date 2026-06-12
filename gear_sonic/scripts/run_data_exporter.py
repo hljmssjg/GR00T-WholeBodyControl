@@ -23,6 +23,9 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 import json
+import os
+from pathlib import Path
+import subprocess
 import time
 
 import numpy as np
@@ -297,6 +300,9 @@ class GrootDataCollector:
         self.latest_proprio_msg = None
         self.latest_sonic_msg = None
         self.latest_planner_msg = None
+        self._latest_state_receive_monotonic = None
+        self._latest_image_receive_monotonic = None
+        self._last_recorded_cpp_state_index = None
 
         self.current_stream_mode = 0
 
@@ -334,8 +340,22 @@ class GrootDataCollector:
 
         self._last_latency_log_time = 0.0
         self._initial_yaw = None
+        self._episode_started_at = None
+        self._pending_episode_outcome = None
+        self._last_motion_name = None
+        self._collector_failed = False
+
+        self._meta_dir = Path(self.data_exporter.meta.root) / "meta"
+        self._events_path = self._meta_dir / "events.jsonl"
+        self._outcomes_path = self._meta_dir / "episode_outcomes.jsonl"
+        self._record_event(
+            "collector_started",
+            frequency_hz=self.frequency,
+            dataset_root=str(self.data_exporter.meta.root),
+        )
 
         print(f"Recording to {self.data_exporter.meta.root}")
+        self._set_pane_status("IDLE | c=start recording")
 
     @property
     def current_episode_index(self):
@@ -347,6 +367,42 @@ class GrootDataCollector:
         else:
             print(message)
 
+    def _set_pane_status(self, status: str) -> None:
+        """Keep recording state visible in the tmux pane border."""
+        pane = os.environ.get("TMUX_PANE")
+        if not pane:
+            return
+        subprocess.run(
+            ["tmux", "select-pane", "-t", pane, "-T", f"DATA: {status}"],
+            capture_output=True,
+            check=False,
+        )
+
+    @staticmethod
+    def _json_default(value):
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        raise TypeError(f"Cannot JSON serialize {type(value).__name__}")
+
+    def _append_jsonl(self, path: Path, payload: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=self._json_default, sort_keys=True) + "\n")
+
+    def _record_event(self, event: str, **data) -> None:
+        self._append_jsonl(
+            self._events_path,
+            {
+                "event": event,
+                "time_unix_s": time.time(),
+                "time_monotonic_s": time.monotonic(),
+                "episode_index": int(self.current_episode_index),
+                **data,
+            },
+        )
+
     def _poll_state_zmq(self):
         """Poll the ``g1_debug`` ZMQ topic for robot state (non-blocking)."""
         msg = self._state_subscriber.get_msg(clear=True)
@@ -357,6 +413,7 @@ class GrootDataCollector:
             msg["ros_timestamp"] = time.time()
 
         self.latest_proprio_msg = msg
+        self._latest_state_receive_monotonic = time.monotonic()
 
     def _check_recording_commands(self):
         """Check keyboard + ZMQ toggle flags for recording commands."""
@@ -369,24 +426,84 @@ class GrootDataCollector:
             key = "c"
             self._manager_toggle_dc = False
 
+        if key is not None:
+            self._record_event("keyboard", key=key)
+
         if key == "c":
-            self._episode_state.change_state()
-            if self._episode_state.get_state() == self._episode_state.RECORDING:
+            if self._episode_state.get_state() == self._episode_state.IDLE:
+                self._episode_state.change_state()
                 self._initial_yaw = None
+                self._last_recorded_cpp_state_index = None
+                self._episode_started_at = time.time()
+                self._pending_episode_outcome = None
+                self._record_event("episode_started")
+                self._set_pane_status(
+                    f"RECORDING ep={int(self.current_episode_index)} | "
+                    "s=success f=failure x=discard"
+                )
                 self._print_and_say(
                     f"开始录制第{int_to_chinese(self.current_episode_index)}条",
                     blocking=False,
                 )
-            elif self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
-                self._print_and_say("停止录制，正在保存", blocking=False)
-            elif self._episode_state.get_state() == self._episode_state.IDLE:
-                self._print_and_say("已保存，回到待机", blocking=False)
+            elif self._episode_state.get_state() == self._episode_state.RECORDING:
+                self._record_event(
+                    "record_start_ignored",
+                    reason="already_recording",
+                )
+                self._print_and_say(
+                    "正在录制，请按S标记成功，或按F标记失败",
+                    blocking=False,
+                )
+            else:
+                self._record_event(
+                    "record_start_ignored",
+                    reason=self._episode_state.get_state(),
+                )
+        elif key in ("s", "f"):
+            if self._episode_state.get_state() == self._episode_state.RECORDING:
+                self._pending_episode_outcome = "success" if key == "s" else "failure"
+                self._episode_state.change_state()
+                self._record_event(
+                    "episode_stop_requested",
+                    outcome=self._pending_episode_outcome,
+                )
+                self._set_pane_status(
+                    f"SAVING {self._pending_episode_outcome.upper()}..."
+                )
+                self._print_and_say(
+                    "任务成功，正在保存" if key == "s" else "任务失败，正在保存",
+                    blocking=False,
+                )
+            else:
+                self._record_event("episode_stop_ignored", key=key, reason="not_recording")
         elif key == "x":
             if self._episode_state.get_state() == self._episode_state.RECORDING:
+                episode_index = int(self.current_episode_index)
+                frame_count = int(self.data_exporter.episode_buffer.get("size", 0))
                 self.data_exporter.save_episode_as_discarded()
+                self._write_episode_outcome(episode_index, "discarded", frame_count)
                 self._episode_state.reset_state()
                 self._initial_yaw = None
+                self._episode_started_at = None
+                self._pending_episode_outcome = None
+                self._record_event("episode_discarded", saved_episode_index=episode_index)
+                self._set_pane_status(f"DISCARDED ep={episode_index} | c=start")
                 self._print_and_say("已丢弃这一条", blocking=False)
+
+    def _write_episode_outcome(
+        self, episode_index: int, outcome: str, frame_count: int
+    ) -> None:
+        self._append_jsonl(
+            self._outcomes_path,
+            {
+                "episode_index": episode_index,
+                "outcome": outcome,
+                "task": self.data_exporter.task,
+                "frame_count": frame_count,
+                "started_at_unix_s": self._episode_started_at,
+                "ended_at_unix_s": time.time(),
+            },
+        )
 
     def _poll_sonic_zmq_messages(self):
         """Poll ZMQ for pose, planner, and manager_state messages (non-blocking)."""
@@ -599,12 +716,28 @@ class GrootDataCollector:
         if self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
+                episode_index = int(self.current_episode_index)
                 self.data_exporter.save_episode()
+                outcome = self._pending_episode_outcome or "unknown"
+                self._write_episode_outcome(episode_index, outcome, int(buffer_size))
                 self.sonic_timing_monitor.reset()
                 self._initial_yaw = None
+                self._record_event(
+                    "episode_saved",
+                    saved_episode_index=episode_index,
+                    outcome=outcome,
+                    frame_count=int(buffer_size),
+                )
+                self._set_pane_status(
+                    f"SAVED {outcome.upper()} ep={episode_index} | c=start"
+                )
                 self._print_and_say("本条保存完成")
             else:
+                self._record_event("episode_save_skipped", reason="no_frames")
+                self._set_pane_status("NOT SAVED: no frames | c=start")
                 self._print_and_say("Skipping save: no frames collected", say=False)
+            self._episode_started_at = None
+            self._pending_episode_outcome = None
             self._episode_state.change_state()
         return True
 
@@ -640,6 +773,11 @@ class GrootDataCollector:
             left_hand_actuated_joint_values=proprio["last_left_hand_action"],
             right_hand_actuated_joint_values=proprio["last_right_hand_action"],
         )
+        whole_dq = self.robot_model.get_configuration_from_actuated_joints(
+            body_actuated_joint_values=proprio.get("body_dq", np.zeros(29)),
+            left_hand_actuated_joint_values=proprio.get("left_hand_dq", np.zeros(7)),
+            right_hand_actuated_joint_values=proprio.get("right_hand_dq", np.zeros(7)),
+        )
 
         self.robot_model.cache_forward_kinematics(whole_q)
         eef_parts = []
@@ -654,6 +792,7 @@ class GrootDataCollector:
 
         frame_data: dict = {
             "observation.state": whole_q,
+            "observation.velocity": whole_dq,
             "observation.eef_state": observation_eef_state,
             "action.wbc": whole_action_wbc,
         }
@@ -661,6 +800,11 @@ class GrootDataCollector:
         self._add_cpp_state_features(frame_data, proprio)
 
         sonic_latency_ms = self._add_sonic_pose_features(frame_data)
+        frame_data["diagnostic.sonic_age_ms"] = np.array(
+            [sonic_latency_ms if sonic_latency_ms is not None else -1.0],
+            dtype=np.float64,
+        )
+        self._add_timing_diagnostics(frame_data, proprio)
 
         self._add_images_to_frame_data(frame_data)
 
@@ -668,6 +812,75 @@ class GrootDataCollector:
 
         self.data_exporter.add_frame(frame_data)
         return self._finalize_frame(t_start)
+
+    @staticmethod
+    def _fixed_array(data: dict, key: str, size: int, default: float = 0.0) -> np.ndarray:
+        value = np.asarray(data.get(key, []), dtype=np.float64).reshape(-1)
+        if value.size != size:
+            return np.full(size, default, dtype=np.float64)
+        return value
+
+    def _add_timing_diagnostics(self, frame_data: dict, proprio: dict) -> None:
+        now = time.monotonic()
+        now_wall = time.time()
+        state_index = int(proprio.get("index", -1))
+        if self._last_recorded_cpp_state_index is None or state_index < 0:
+            state_index_delta = 0
+        else:
+            state_index_delta = state_index - self._last_recorded_cpp_state_index
+        if state_index >= 0:
+            self._last_recorded_cpp_state_index = state_index
+
+        state_age_ms = (
+            (now - self._latest_state_receive_monotonic) * 1000.0
+            if self._latest_state_receive_monotonic is not None
+            else -1.0
+        )
+        camera_age_ms = (
+            (now - self._latest_image_receive_monotonic) * 1000.0
+            if self._latest_image_receive_monotonic is not None
+            else -1.0
+        )
+
+        image_state_delta_ms = -1.0
+        camera_timestamp = -1.0
+        state_timestamp = float(
+            proprio.get("wall_timestamp", proprio.get("ros_timestamp", 0.0))
+        )
+        if state_timestamp > 0 and self.latest_image_msg is not None:
+            image_timestamps = self.latest_image_msg.get("timestamps", {})
+            if image_timestamps:
+                camera_timestamp = float(
+                    image_timestamps.get("ego_view", next(iter(image_timestamps.values())))
+                )
+                image_state_delta_ms = max(
+                    abs(float(ts) - state_timestamp) for ts in image_timestamps.values()
+                ) * 1000.0
+
+        frame_data["diagnostic.cpp_state_index"] = np.array(
+            [state_index], dtype=np.int64
+        )
+        frame_data["diagnostic.cpp_state_index_delta"] = np.array(
+            [state_index_delta], dtype=np.int64
+        )
+        frame_data["diagnostic.cpp_wall_timestamp_s"] = np.array(
+            [state_timestamp], dtype=np.float64
+        )
+        frame_data["diagnostic.camera_timestamp_s"] = np.array(
+            [camera_timestamp], dtype=np.float64
+        )
+        frame_data["diagnostic.exporter_timestamp_s"] = np.array(
+            [now_wall], dtype=np.float64
+        )
+        frame_data["diagnostic.state_age_ms"] = np.array(
+            [state_age_ms], dtype=np.float64
+        )
+        frame_data["diagnostic.camera_age_ms"] = np.array(
+            [camera_age_ms], dtype=np.float64
+        )
+        frame_data["diagnostic.image_state_delta_ms"] = np.array(
+            [image_state_delta_ms], dtype=np.float64
+        )
 
     def _add_cpp_state_features(self, frame_data: dict, proprio: dict) -> None:
         if "base_quat" in proprio:
@@ -713,10 +926,50 @@ class GrootDataCollector:
         else:
             frame_data["teleop.delta_heading"] = np.zeros(1, dtype=np.float64)
 
-        if "token_state" in proprio:
-            frame_data["action.motion_token"] = np.asarray(proprio["token_state"], dtype=np.float64)
-        else:
-            frame_data["action.motion_token"] = np.zeros(64, dtype=np.float64)
+        frame_data["action.motion_token"] = self._fixed_array(
+            proprio, "token_state", 64
+        )
+
+        frame_data["observation.base_angular_velocity"] = self._fixed_array(
+            proprio, "base_ang_vel", 3
+        )
+        frame_data["observation.base_acceleration"] = self._fixed_array(
+            proprio, "base_accel", 3
+        )
+        torso_orientation = self._fixed_array(proprio, "body_torso_quat", 4)
+        if not np.any(torso_orientation):
+            torso_orientation[0] = 1.0
+        frame_data["observation.torso_orientation"] = torso_orientation
+        frame_data["observation.torso_angular_velocity"] = self._fixed_array(
+            proprio, "body_torso_ang_vel", 3
+        )
+        frame_data["observation.torso_acceleration"] = self._fixed_array(
+            proprio, "body_torso_accel", 3
+        )
+        frame_data["observation.motor_temperature"] = self._fixed_array(
+            proprio, "motor_temperature", 58, default=-1.0
+        )
+        frame_data["observation.motor_error"] = self._fixed_array(
+            proprio, "motor_error", 29, default=-1.0
+        )
+        frame_data["observation.motor_torque"] = self._fixed_array(
+            proprio, "motor_torque", 29
+        )
+        frame_data["diagnostic.encoder_mode"] = np.array(
+            [int(proprio.get("encoder_mode", -2))], dtype=np.int32
+        )
+        frame_data["diagnostic.motion_play"] = np.array(
+            [int(bool(proprio.get("play", False)))], dtype=np.int32
+        )
+
+        motion_name = str(proprio.get("motion_name", ""))
+        if motion_name != self._last_motion_name:
+            self._record_event(
+                "motion_changed",
+                previous=self._last_motion_name,
+                current=motion_name,
+            )
+            self._last_motion_name = motion_name
 
     def _add_sonic_pose_features(self, frame_data: dict) -> float | None:
         """Add teleop features based on current stream mode."""
@@ -883,19 +1136,33 @@ class GrootDataCollector:
         return quat_to_rot6d(target_quat)
 
     def save_and_cleanup(self):
-        try:
-            self._print_and_say("正在保存收尾", blocking=False)
-            buffer_size = self.data_exporter.episode_buffer.get("size", 0)
-            if buffer_size > 0:
-                self.data_exporter.save_episode()
-            self._print_and_say(
-                f"Recording complete: {self.data_exporter.meta.root}", say=False, blocking=True
-            )
-        except Exception as e:
-            # Print the full (English) error for the console, but speak a short
-            # Chinese line — the G1 voice would garble the raw exception text.
-            print(f"Error saving episode: {e}")
-            self._print_and_say("保存出错", blocking=True)
+        if not self._collector_failed:
+            try:
+                self._set_pane_status("FINALIZING...")
+                self._print_and_say("正在保存收尾", blocking=False)
+                buffer_size = self.data_exporter.episode_buffer.get("size", 0)
+                if buffer_size > 0:
+                    episode_index = int(self.current_episode_index)
+                    self.data_exporter.save_episode()
+                    self._write_episode_outcome(
+                        episode_index,
+                        self._pending_episode_outcome or "interrupted",
+                        int(buffer_size),
+                    )
+                self._print_and_say(
+                    f"Recording complete: {self.data_exporter.meta.root}",
+                    say=False,
+                    blocking=True,
+                )
+                self._set_pane_status("STOPPED | data finalized")
+            except Exception as e:
+                # Print the full (English) error for the console, but speak a short
+                # Chinese line — the G1 voice would garble the raw exception text.
+                print(f"Error saving episode: {e}")
+                self._set_pane_status(f"SAVE ERROR: {type(e).__name__}")
+                self._print_and_say("保存出错", blocking=True)
+
+        self._record_event("collector_stopped")
 
         try:
             self._state_subscriber.close()
@@ -931,6 +1198,7 @@ class GrootDataCollector:
                         img_msg = self._image_subscriber.read()
                         if img_msg is not None:
                             self.latest_image_msg = img_msg
+                            self._latest_image_receive_monotonic = time.monotonic()
 
                     with self.telemetry.timer("add_frame"):
                         self._add_data_frame()
@@ -954,7 +1222,30 @@ class GrootDataCollector:
             print("Data exporter terminated by user")
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
+                episode_index = int(self.current_episode_index)
                 self.data_exporter.save_episode_as_discarded()
+                self._write_episode_outcome(
+                    episode_index,
+                    "discarded",
+                    int(buffer_size),
+                )
+                self._record_event(
+                    "episode_discarded",
+                    saved_episode_index=episode_index,
+                    reason="keyboard_interrupt",
+                )
+        except Exception as e:
+            self._collector_failed = True
+            self._set_pane_status(f"SAVE ERROR: {type(e).__name__}")
+            try:
+                self._record_event(
+                    "collector_error",
+                    error_type=type(e).__name__,
+                    error=str(e),
+                )
+            except Exception:
+                pass
+            raise
 
         finally:
             self.save_and_cleanup()

@@ -98,9 +98,50 @@ class Gr00tDatasetMetadata(LeRobotDatasetMetadata):
     MODALITY_CONFIG_REL_PATH = Path("meta/modality.json")
 
     def __init__(self, *args, **kwargs):
+        root = kwargs.get("root")
+        if root is None and len(args) >= 2:
+            root = args[1]
+        if root is not None:
+            self._sanitize_legacy_episode_stats(Path(root))
         super().__init__(*args, **kwargs)
         with open(self.root / self.MODALITY_CONFIG_REL_PATH, "rb") as f:
             self.modality_config = json.load(f)
+
+    @staticmethod
+    def _sanitize_legacy_episode_stats(root: Path) -> None:
+        """Remove scalar stats that LeRobot 2.1 mistakes for image stats."""
+        info_path = root / "meta" / "info.json"
+        stats_path = root / "meta" / "episodes_stats.jsonl"
+        if not info_path.exists() or not stats_path.exists():
+            return
+
+        features = json.loads(info_path.read_text(encoding="utf-8")).get("features", {})
+        invalid_keys = {
+            key
+            for key, feature in features.items()
+            if "image" in key and feature.get("dtype") not in ["image", "video"]
+        }
+        if not invalid_keys:
+            return
+
+        records = []
+        changed = False
+        for line in stats_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            stats = record.get("stats", {})
+            for key in invalid_keys:
+                changed = stats.pop(key, None) is not None or changed
+            records.append(record)
+
+        if changed:
+            temp_path = stats_path.with_suffix(".jsonl.tmp")
+            temp_path.write_text(
+                "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            temp_path.replace(stats_path)
 
     @classmethod
     def create(
@@ -318,8 +359,13 @@ class Gr00tDataExporter(LeRobotDataset):
         self.video_writers = self.create_video_writer()
 
     def save_episode(self, episode_data: dict | None = None) -> None:
-        if not episode_data:
-            episode_buffer = self.episode_buffer
+        if episode_data is None:
+            # Preparing an episode mutates the buffer (lists become arrays and
+            # scalar episode_index becomes a column). Keep the live buffer
+            # intact so a failed save does not corrupt collector cleanup.
+            episode_buffer = copy.deepcopy(self.episode_buffer)
+        else:
+            episode_buffer = copy.deepcopy(episode_data)
 
         validate_episode_buffer(episode_buffer, self.meta.total_episodes, self.features)
 
@@ -353,6 +399,15 @@ class Gr00tDataExporter(LeRobotDataset):
             k: v for k, v in episode_buffer.items() if k in non_video_features.keys()
         }
         ep_stats = compute_episode_stats(non_vid_ep_buffer, non_video_features)
+        # LeRobot 2.1 classifies any stats key containing "image" as RGB data
+        # during multi-episode aggregation. Scalar diagnostics with such names
+        # therefore trigger a false (3,1,1) shape error on episode 1. Their
+        # frame data remains in parquet; only optional aggregate stats are
+        # omitted. Also sanitize stats loaded from a dataset made by old code.
+        for key, feature in non_video_features.items():
+            if "image" in key and feature["dtype"] not in ["image", "video"]:
+                ep_stats.pop(key, None)
+                self.meta.stats.pop(key, None)
 
         if len(self.meta.video_keys) > 0:
             video_paths = self.encode_episode_videos(episode_index)
@@ -381,7 +436,7 @@ class Gr00tDataExporter(LeRobotDataset):
         if img_dir.is_dir():
             shutil.rmtree(self.root / "images")
 
-        if not episode_data:
+        if episode_data is None:
             self.episode_buffer = self.create_episode_buffer()
             self.video_writers = self.create_video_writer()
 

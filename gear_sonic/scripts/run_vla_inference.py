@@ -24,6 +24,8 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
 """
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
 import queue
 import threading
 import time
@@ -118,9 +120,127 @@ class InferenceConfig:
     verbose_timing: bool = False
     """Whether to always print timing info (not just when loop is slow)."""
 
+    diagnostic_log_dir: str = ""
+    """Directory for native inference chunk/action/event logs. Empty disables it."""
+
 
 def print_green(x):
     print(f"\033[92m{x}\033[0m")
+
+
+class InferenceDiagnosticLogger:
+    """Crash-tolerant sidecar logs for policy decisions and published actions."""
+
+    def __init__(self, root: str, config: InferenceConfig):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.chunks_dir = self.root / "chunks"
+        self.chunks_dir.mkdir(exist_ok=True)
+        self._lock = threading.Lock()
+        self._chunk_seq = 0
+        self._events = open(self.root / "events.jsonl", "a", encoding="utf-8", buffering=1)
+        self._actions = open(
+            self.root / "published_actions.jsonl",
+            "a",
+            encoding="utf-8",
+            buffering=1,
+        )
+        (self.root / "session.json").write_text(
+            json.dumps(
+                {
+                    "started_at_unix_s": time.time(),
+                    "policy_server": f"{config.host}:{config.port}",
+                    "embodiment_tag": config.embodiment_tag,
+                    "initial_prompt": config.prompt,
+                    "action_horizon": config.action_horizon,
+                    "action_publish_rate_hz": config.action_publish_rate,
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _json_line(payload: dict) -> str:
+        return json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n"
+
+    def log_event(self, event: str, **data) -> None:
+        payload = {
+            "event": event,
+            "time_unix_s": time.time(),
+            "time_monotonic_s": time.monotonic(),
+            **data,
+        }
+        with self._lock:
+            self._events.write(self._json_line(payload))
+
+    def log_chunk(
+        self,
+        processed_action: dict,
+        prompt: str,
+        inference_ms: float,
+        selected_start_index: int,
+        first_after_resume: bool,
+    ) -> int:
+        chunk_id = self._chunk_seq
+        self._chunk_seq += 1
+        motion_token = np.asarray(
+            get_action_field(processed_action, "motion_token"), dtype=np.float32
+        )
+        left_hand = np.asarray(
+            get_action_field(processed_action, "left_hand_joints"), dtype=np.float32
+        )
+        right_hand = np.asarray(
+            get_action_field(processed_action, "right_hand_joints"), dtype=np.float32
+        )
+        chunk_path = self.chunks_dir / f"chunk_{chunk_id:06d}.npz"
+        np.savez_compressed(
+            chunk_path,
+            motion_token=motion_token,
+            left_hand_joints=left_hand,
+            right_hand_joints=right_hand,
+        )
+        self.log_event(
+            "inference_chunk",
+            chunk_id=chunk_id,
+            prompt=prompt,
+            inference_ms=inference_ms,
+            selected_start_index=selected_start_index,
+            first_after_resume=first_after_resume,
+            data_file=str(chunk_path.relative_to(self.root)),
+        )
+        return chunk_id
+
+    def log_action(
+        self,
+        *,
+        frame_index: int,
+        chunk_id: int,
+        chunk_index: int,
+        blend_alpha: float,
+        motion_token: np.ndarray,
+        left_hand_joints: np.ndarray,
+        right_hand_joints: np.ndarray,
+    ) -> None:
+        payload = {
+            "time_unix_s": time.time(),
+            "time_monotonic_s": time.monotonic(),
+            "frame_index": frame_index,
+            "chunk_id": chunk_id,
+            "chunk_index": chunk_index,
+            "blend_alpha": blend_alpha,
+            "motion_token": np.asarray(motion_token).tolist(),
+            "left_hand_joints": np.asarray(left_hand_joints).tolist(),
+            "right_hand_joints": np.asarray(right_hand_joints).tolist(),
+        }
+        with self._lock:
+            self._actions.write(self._json_line(payload))
+
+    def close(self) -> None:
+        self.log_event("inference_logger_stopped")
+        self._events.close()
+        self._actions.close()
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +389,7 @@ def prepare_observation_from_sensors(
     return observation
 
 
-def run_policy_inference_and_process(policy, observation, robot_model):
+def run_policy_inference_and_process(policy, observation, robot_model, diagnostic_event=None):
     """Run policy inference via Isaac-GR00T PolicyClient and process results.
 
     Returns:
@@ -283,17 +403,22 @@ def run_policy_inference_and_process(policy, observation, robot_model):
 
         motion_key = "motion_token" if "motion_token" in action else "action.motion_token"
         if np.abs(action[motion_key]).max() > 1.25:
+            max_token = float(np.abs(action[motion_key]).max())
             print(
                 f"[Warning] action['{motion_key}'] max "
-                f"({np.abs(action[motion_key]).max():.4f}) > 1.25. "
+                f"({max_token:.4f}) > 1.25. "
                 "Exceeds action bound, skipping."
             )
+            if diagnostic_event is not None:
+                diagnostic_event("action_bound_violation", max_token=max_token)
             return None
 
         processed_action = concat_action(robot_model, action)
         return processed_action
     except Exception as e:
         print(f"Error in inference: {e}")
+        if diagnostic_event is not None:
+            diagnostic_event("inference_error", error=repr(e))
         import traceback
 
         traceback.print_exc()
@@ -395,6 +520,13 @@ def main(config: InferenceConfig):
     )
 
     telemetry = Telemetry(window_size=100)
+    diagnostic_logger = (
+        InferenceDiagnosticLogger(config.diagnostic_log_dir, config)
+        if config.diagnostic_log_dir
+        else None
+    )
+    if diagnostic_logger is not None:
+        diagnostic_logger.log_event("inference_logger_started")
 
     loop_rate = config.action_publish_rate
     loop_period = 1.0 / loop_rate
@@ -458,6 +590,7 @@ def main(config: InferenceConfig):
     # Async inference state
     cached_action_chunk = None
     action_chunk_index = 0
+    current_chunk_id = -1
     last_inference_time = 0.0
     inference_interval = 1.0 / config.rate
 
@@ -483,18 +616,27 @@ def main(config: InferenceConfig):
         nonlocal pause_loop, cpp_loop_running, cpp_mode
         nonlocal initial_pose_left_hand_closed, initial_pose_right_hand_closed
         nonlocal cached_action_chunk, action_chunk_index, last_inference_time
+        nonlocal current_chunk_id
         nonlocal zmq_frame_counter
         nonlocal resume_blend_steps_remaining, first_chunk_after_resume
 
         key = keyboard_listener.read_msg()
         if key is None:
             return
+        if diagnostic_logger is not None:
+            diagnostic_logger.log_event("keyboard", key=key)
 
         if key.startswith(PROMPT_MSG_PREFIX):
             new_prompt = key[len(PROMPT_MSG_PREFIX):]
             if new_prompt:
                 old_prompt = language_prompt_ref[0]
                 language_prompt_ref[0] = new_prompt
+                if diagnostic_logger is not None:
+                    diagnostic_logger.log_event(
+                        "prompt_changed",
+                        previous=old_prompt,
+                        current=new_prompt,
+                    )
                 print_green(f'Inference prompt changed: "{old_prompt}" -> "{new_prompt}"')
             else:
                 print("Received empty prompt change -- ignoring.")
@@ -513,6 +655,7 @@ def main(config: InferenceConfig):
             publish_initial_pose()
             cached_action_chunk = None
             action_chunk_index = 0
+            current_chunk_id = -1
             print("Cleared cached action chunk")
             if cpp_loop_running and cpp_mode == "PLANNER":
                 if send_cpp_control_command(start=True, planner=False):
@@ -534,6 +677,7 @@ def main(config: InferenceConfig):
                 # robot hasn't been executing the chunk's earlier steps).
                 cached_action_chunk = None
                 action_chunk_index = 0
+                current_chunk_id = -1
                 last_inference_time = 0.0
                 try:
                     while True:
@@ -599,6 +743,11 @@ def main(config: InferenceConfig):
                 policy=n1_policy,
                 observation=obs,
                 robot_model=robot_model,
+                diagnostic_event=(
+                    diagnostic_logger.log_event
+                    if diagnostic_logger is not None
+                    else None
+                ),
             ),
         ),
         daemon=True,
@@ -621,6 +770,7 @@ def main(config: InferenceConfig):
             # Consume result first so last_inference_time is fresh before trigger check
             try:
                 processed_action, inference_start_time = result_queue.get_nowait()
+                was_first_after_resume = first_chunk_after_resume
                 if first_chunk_after_resume:
                     # Robot was holding init pose, not executing this chunk's
                     # earlier steps — start from index 0 instead of skipping
@@ -639,6 +789,14 @@ def main(config: InferenceConfig):
                     )
                 cached_action_chunk = processed_action
                 last_inference_time = time.monotonic()
+                if diagnostic_logger is not None:
+                    current_chunk_id = diagnostic_logger.log_chunk(
+                        processed_action=processed_action,
+                        prompt=language_prompt_ref[0],
+                        inference_ms=inference_delay * 1000.0,
+                        selected_start_index=action_chunk_index,
+                        first_after_resume=was_first_after_resume,
+                    )
                 print_green(
                     f'New action chunk (prompt: "{language_prompt_ref[0]}", '
                     f"latency: {inference_delay:.3f}s)"
@@ -703,12 +861,14 @@ def main(config: InferenceConfig):
                     if right_hand_joints.ndim == 2:
                         right_hand_joints = right_hand_joints[current_idx]
 
+                    blend_alpha = 1.0
                     # Linear blend from init pose to policy output over the
                     # first resume_blend_steps_total publishes after 'p'.
                     if resume_blend_steps_remaining > 0:
                         step = resume_blend_steps_total - resume_blend_steps_remaining
                         denom = max(1, resume_blend_steps_total - 1)
                         alpha = float(step) / float(denom)
+                        blend_alpha = alpha
                         motion_token = (
                             (1.0 - alpha) * init_blend_motion_token + alpha * motion_token
                         ).astype(np.float32)
@@ -732,6 +892,16 @@ def main(config: InferenceConfig):
                         right_hand_joints=right_hand_joints,
                     )
                     zmq_socket.send(zmq_message)
+                    if diagnostic_logger is not None:
+                        diagnostic_logger.log_action(
+                            frame_index=int(frame_index[0]),
+                            chunk_id=current_chunk_id,
+                            chunk_index=current_idx,
+                            blend_alpha=blend_alpha,
+                            motion_token=motion_token,
+                            left_hand_joints=left_hand_joints,
+                            right_hand_joints=right_hand_joints,
+                        )
                     if zmq_frame_counter % 50 == 0:
                         print_green(
                             f"ZMQ: Sent latent action - "
@@ -757,7 +927,12 @@ def main(config: InferenceConfig):
 
     finally:
         inference_stop_event.set()
-        inference_worker_thread.join(timeout=1.0)
+        inference_worker_thread.join(timeout=5.0)
+        if diagnostic_logger is not None:
+            if inference_worker_thread.is_alive():
+                diagnostic_logger.log_event("worker_join_timeout")
+            else:
+                diagnostic_logger.close()
         zmq_socket.close()
         zmq_context.term()
         state_subscriber.close()

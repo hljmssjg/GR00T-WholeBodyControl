@@ -23,18 +23,18 @@ python3 gear_sonic/scripts/launch_data_collection.py \
 
 cd /home/jg/baseline/GR00T-WholeBodyControl
 python3 gear_sonic/scripts/run_episode_browser.py \
-  --dataset outputs/2026-05-27-merged \
+  --dataset outputs/2026-06-11-merged \
   --port 8765
 
 
 .venv_data_collection/bin/python gear_sonic/scripts/process_dataset.py \
-  --dataset-path outputs/2026-05-27-merged \
-  --output-path outputs/2026-05-27-final \
+  --dataset-path outputs/2026-06-11-merged \
+  --output-path outputs/2026-06-11-final \
   --no-remove-stale-smpl
 
 
-.venv_data_collection/bin/hf upload Jiangeng/G1_05_26 \
-  outputs/2026-05-26-final . \
+.venv_data_collection/bin/hf upload Jiangeng/G1_06_11 \
+  outputs/2026-06-11-final . \
   --repo-type dataset
 
 

@@ -1,0 +1,182 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1050" viewBox="0 0 1800 1050">
+  <defs>
+    <style>
+      .title { font: 700 34px "Noto Sans CJK SC", "Source Han Sans SC", Arial, sans-serif; fill: #102033; }
+      .subtitle { font: 500 18px "Noto Sans CJK SC", "Source Han Sans SC", Arial, sans-serif; fill: #516171; }
+      .lane-title { font: 700 21px "Noto Sans CJK SC", "Source Han Sans SC", Arial, sans-serif; fill: #1d3557; }
+      .box-title { font: 700 22px "Noto Sans CJK SC", "Source Han Sans SC", Arial, sans-serif; fill: #102033; }
+      .box-sub { font: 500 15px "Noto Sans CJK SC", "Source Han Sans SC", Arial, sans-serif; fill: #435466; }
+      .tensor { font: 600 14px "Noto Sans Mono CJK SC", "JetBrains Mono", Consolas, monospace; fill: #26384b; }
+      .small { font: 500 13px "Noto Sans CJK SC", "Source Han Sans SC", Arial, sans-serif; fill: #5c6b78; }
+      .legend { font: 500 15px "Noto Sans CJK SC", "Source Han Sans SC", Arial, sans-serif; fill: #384b5f; }
+      .box { stroke-width: 2.2; rx: 20; ry: 20; }
+      .input { fill: #f0f7ff; stroke: #5b9bd5; }
+      .policy { fill: #fff7e8; stroke: #e59f35; }
+      .control { fill: #eef8f1; stroke: #48a868; }
+      .robot { fill: #f7eefc; stroke: #9b59b6; }
+      .log { fill: #f4f6f8; stroke: #768696; }
+      .arrow { stroke: #27384a; stroke-width: 2.8; fill: none; marker-end: url(#arrow); }
+      .arrow-soft { stroke: #6b7c8d; stroke-width: 2.1; fill: none; marker-end: url(#arrow-soft); }
+      .arrow-dash { stroke: #7a8794; stroke-width: 2.0; fill: none; stroke-dasharray: 7 6; marker-end: url(#arrow-soft); }
+      .feedback { stroke: #8a4fb3; stroke-width: 2.6; fill: none; stroke-dasharray: 9 7; marker-end: url(#arrow-purple); }
+      .badge { fill: #ffffff; stroke: #ccd6e0; stroke-width: 1.4; rx: 11; ry: 11; }
+      .lane { fill: #ffffff; stroke: #e1e7ee; stroke-width: 1.5; rx: 26; ry: 26; }
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#27384a"/>
+    </marker>
+    <marker id="arrow-soft" markerWidth="11" markerHeight="11" refX="9.5" refY="5.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L9.5,5.5 L2,9 Z" fill="#6b7c8d"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#8a4fb3"/>
+    </marker>
+    <filter id="shadow" x="-8%" y="-8%" width="116%" height="116%">
+      <feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#1b2b3a" flood-opacity="0.14"/>
+    </filter>
+  </defs>
+
+  <rect x="0" y="0" width="1800" height="1050" fill="#ffffff"/>
+
+  <text x="70" y="62" class="title">GR00T N1.7 + SONIC 真机评估系统架构</text>
+  <text x="70" y="93" class="subtitle">实时感知输入经 VLA 生成 latent action，SONIC 解码与控制策略将 token 转换为真机动作；旁路日志记录跨模块因果链。</text>
+
+  <rect x="50" y="125" width="1700" height="210" class="lane"/>
+  <rect x="50" y="370" width="1700" height="265" class="lane"/>
+  <rect x="50" y="675" width="1700" height="250" class="lane"/>
+
+  <text x="80" y="160" class="lane-title">实时输入与高层决策</text>
+  <text x="80" y="405" class="lane-title">Token 到控制动作</text>
+  <text x="80" y="710" class="lane-title">真机执行、反馈与诊断记录</text>
+
+  <!-- Inputs -->
+  <rect x="95" y="185" width="210" height="105" class="box input" filter="url(#shadow)"/>
+  <text x="200" y="222" text-anchor="middle" class="box-title">实时视觉输入</text>
+  <text x="200" y="250" text-anchor="middle" class="box-sub">ego RGB stream</text>
+  <text x="200" y="273" text-anchor="middle" class="box-sub">可选 wrist stream</text>
+
+  <rect x="95" y="440" width="210" height="120" class="box input" filter="url(#shadow)"/>
+  <text x="200" y="480" text-anchor="middle" class="box-title">机器人本体状态</text>
+  <text x="200" y="509" text-anchor="middle" class="box-sub">q / dq, base IMU</text>
+  <text x="200" y="532" text-anchor="middle" class="box-sub">torso IMU, motor state</text>
+
+  <rect x="95" y="735" width="210" height="105" class="box input" filter="url(#shadow)"/>
+  <text x="200" y="773" text-anchor="middle" class="box-title">任务语言</text>
+  <text x="200" y="802" text-anchor="middle" class="box-sub">prompt</text>
+  <text x="200" y="825" text-anchor="middle" class="box-sub">例如放小熊进袋子</text>
+
+  <!-- Observation and VLA -->
+  <rect x="390" y="185" width="255" height="140" class="box input" filter="url(#shadow)"/>
+  <text x="517.5" y="226" text-anchor="middle" class="box-title">Observation 构造</text>
+  <text x="517.5" y="256" text-anchor="middle" class="box-sub">时间对齐 + 状态分组</text>
+  <text x="517.5" y="280" text-anchor="middle" class="box-sub">image, q, gravity, prompt</text>
+  <text x="517.5" y="303" text-anchor="middle" class="box-sub">生成 VLA observation</text>
+
+  <rect x="735" y="185" width="260" height="140" class="box policy" filter="url(#shadow)"/>
+  <text x="865" y="225" text-anchor="middle" class="box-title">VLA 高层策略</text>
+  <text x="865" y="255" text-anchor="middle" class="box-sub">GR00T N1.7</text>
+  <text x="865" y="279" text-anchor="middle" class="box-sub">视觉语言到 latent action</text>
+  <text x="865" y="303" text-anchor="middle" class="box-sub">输出未来动作 chunk</text>
+
+  <rect x="1085" y="185" width="275" height="140" class="box policy" filter="url(#shadow)"/>
+  <text x="1222.5" y="225" text-anchor="middle" class="box-title">Action Chunk 调度</text>
+  <text x="1222.5" y="255" text-anchor="middle" class="box-sub">latency compensation</text>
+  <text x="1222.5" y="279" text-anchor="middle" class="box-sub">resume blend</text>
+  <text x="1222.5" y="303" text-anchor="middle" class="box-sub">50 Hz step selection</text>
+
+  <!-- Control path -->
+  <rect x="390" y="445" width="245" height="130" class="box control" filter="url(#shadow)"/>
+  <text x="512.5" y="486" text-anchor="middle" class="box-title">Token 接收与缓存</text>
+  <text x="512.5" y="516" text-anchor="middle" class="box-sub">protocol v4</text>
+  <text x="512.5" y="540" text-anchor="middle" class="box-sub">external token buffer</text>
+
+  <rect x="735" y="445" width="285" height="130" class="box control" filter="url(#shadow)"/>
+  <text x="877.5" y="486" text-anchor="middle" class="box-title">SONIC 解码 / 控制策略</text>
+  <text x="877.5" y="516" text-anchor="middle" class="box-sub">model_decoder.onnx</text>
+  <text x="877.5" y="540" text-anchor="middle" class="box-sub">token + 本体状态 -> body action</text>
+
+  <rect x="1110" y="445" width="255" height="130" class="box control" filter="url(#shadow)"/>
+  <text x="1237.5" y="486" text-anchor="middle" class="box-title">动作后处理</text>
+  <text x="1237.5" y="516" text-anchor="middle" class="box-sub">scale + default angle</text>
+  <text x="1237.5" y="540" text-anchor="middle" class="box-sub">body/hand q target</text>
+
+  <rect x="1450" y="445" width="235" height="130" class="box control" filter="url(#shadow)"/>
+  <text x="1567.5" y="486" text-anchor="middle" class="box-title">低层控制与安全层</text>
+  <text x="1567.5" y="516" text-anchor="middle" class="box-sub">PD / WBC / lowcmd</text>
+  <text x="1567.5" y="540" text-anchor="middle" class="box-sub">limit / safety</text>
+
+  <!-- Robot and logs -->
+  <rect x="735" y="740" width="285" height="130" class="box robot" filter="url(#shadow)"/>
+  <text x="877.5" y="780" text-anchor="middle" class="box-title">G1 真机执行</text>
+  <text x="877.5" y="810" text-anchor="middle" class="box-sub">真实运动 / 接触 / 负载</text>
+  <text x="877.5" y="834" text-anchor="middle" class="box-sub">产生下一时刻反馈状态</text>
+
+  <rect x="1190" y="720" width="390" height="170" class="box log" filter="url(#shadow)"/>
+  <text x="1385" y="760" text-anchor="middle" class="box-title">旁路记录与诊断</text>
+  <text x="1385" y="790" text-anchor="middle" class="box-sub">LeRobot parquet / mp4</text>
+  <text x="1385" y="815" text-anchor="middle" class="box-sub">useful 因果链日志</text>
+  <text x="1385" y="842" text-anchor="middle" class="tensor">request_id, chunk_id, receive_seq, tick_id</text>
+  <text x="1385" y="866" text-anchor="middle" class="tensor">latency_edges, pipeline_frames</text>
+
+  <!-- Main arrows -->
+  <path d="M305 237 C335 237 355 250 390 250" class="arrow"/>
+  <path d="M305 500 C348 500 348 290 390 285" class="arrow-soft"/>
+  <path d="M305 787 C350 787 340 315 390 305" class="arrow-soft"/>
+  <path d="M645 255 L735 255" class="arrow"/>
+  <path d="M995 255 L1085 255" class="arrow"/>
+  <path d="M1222 325 C1222 392 602 380 555 445" class="arrow"/>
+  <path d="M635 510 L735 510" class="arrow"/>
+  <path d="M1020 510 L1110 510" class="arrow"/>
+  <path d="M1365 510 L1450 510" class="arrow"/>
+  <path d="M1567 575 C1510 690 1070 805 1020 805" class="arrow"/>
+  <path d="M735 805 C600 805 338 646 260 560" class="feedback"/>
+  <path d="M735 790 C640 702 342 585 305 530" class="feedback"/>
+
+  <!-- Side logging arrows -->
+  <path d="M520 325 C620 675 1080 740 1190 760" class="arrow-dash"/>
+  <path d="M865 325 C915 660 1125 735 1190 775" class="arrow-dash"/>
+  <path d="M1222 325 C1240 610 1255 675 1258 720" class="arrow-dash"/>
+  <path d="M512 575 C680 705 1035 735 1190 795" class="arrow-dash"/>
+  <path d="M878 575 C960 665 1080 710 1190 815" class="arrow-dash"/>
+  <path d="M1238 575 C1278 650 1305 688 1325 720" class="arrow-dash"/>
+  <path d="M875 870 C960 910 1120 905 1190 855" class="arrow-dash"/>
+  <path d="M200 290 C210 680 1000 900 1190 870" class="arrow-dash"/>
+
+  <!-- Arrow labels -->
+  <rect x="658" y="226" width="65" height="25" class="badge"/>
+  <text x="690.5" y="244" text-anchor="middle" class="tensor">obs</text>
+
+  <rect x="1008" y="206" width="132" height="48" class="badge"/>
+  <text x="1074" y="225" text-anchor="middle" class="tensor">token[40,64]</text>
+  <text x="1074" y="244" text-anchor="middle" class="tensor">hand[40,7]</text>
+
+  <rect x="916" y="382" width="170" height="48" class="badge"/>
+  <text x="1001" y="401" text-anchor="middle" class="tensor">token_state[64]</text>
+  <text x="1001" y="420" text-anchor="middle" class="tensor">@ 50 Hz</text>
+
+  <rect x="1034" y="482" width="67" height="25" class="badge"/>
+  <text x="1067.5" y="500" text-anchor="middle" class="tensor">a[29]</text>
+
+  <rect x="1377" y="482" width="62" height="25" class="badge"/>
+  <text x="1408" y="500" text-anchor="middle" class="tensor">q_tgt</text>
+
+  <rect x="1450" y="625" width="93" height="25" class="badge"/>
+  <text x="1496.5" y="643" text-anchor="middle" class="tensor">lowcmd</text>
+
+  <rect x="420" y="738" width="143" height="25" class="badge"/>
+  <text x="491.5" y="756" text-anchor="middle" class="tensor">state feedback</text>
+
+  <!-- Legend -->
+  <rect x="70" y="955" width="1660" height="58" rx="18" ry="18" fill="#fafbfc" stroke="#e1e7ee"/>
+  <circle cx="100" cy="984" r="8" fill="#f0f7ff" stroke="#5b9bd5" stroke-width="2"/>
+  <text x="118" y="989" class="legend">输入/状态模块</text>
+  <circle cx="255" cy="984" r="8" fill="#fff7e8" stroke="#e59f35" stroke-width="2"/>
+  <text x="273" y="989" class="legend">VLA 与 action chunk</text>
+  <circle cx="460" cy="984" r="8" fill="#eef8f1" stroke="#48a868" stroke-width="2"/>
+  <text x="478" y="989" class="legend">SONIC / 控制链路</text>
+  <circle cx="660" cy="984" r="8" fill="#f7eefc" stroke="#9b59b6" stroke-width="2"/>
+  <text x="678" y="989" class="legend">真实机器人反馈</text>
+  <line x1="865" y1="984" x2="920" y2="984" class="arrow-dash" marker-end="none"/>
+  <text x="935" y="989" class="legend">虚线表示旁路日志，不参与控制闭环</text>
+  <text x="1260" y="989" class="legend">关键诊断：输入时延、VLA 输出、C++ 接收、SONIC 动作、低层命令、跟踪误差</text>
+</svg>

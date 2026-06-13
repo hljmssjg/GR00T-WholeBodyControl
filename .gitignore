@@ -155,6 +155,7 @@ cython_debug/
 
 # log
 outputs/
+/annotations/
 
 # Ruff stuff:
 .ruff_cache/
